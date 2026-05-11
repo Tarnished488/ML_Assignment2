@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -6,10 +8,14 @@ from sklearn.preprocessing import StandardScaler
 DATA_DIR = r"C:\Users\yqy08\Desktop\数据挖掘和机器学习\Assignment\Assignment 2\comp-3027-j-assignment-2-bdic-2026"
 
 
+def _resolve_data_dir(data_dir=None):
+    """Use explicit path first, then ASSIGNMENT2_DATA_DIR, then the legacy default."""
+    return data_dir or os.environ.get("ASSIGNMENT2_DATA_DIR") or DATA_DIR
+
+
 def load_labeled_data(data_dir=None):
     """Load labeled training data (features + labels)."""
-    if data_dir is None:
-        data_dir = DATA_DIR
+    data_dir = _resolve_data_dir(data_dir)
     X = pd.read_csv(f"{data_dir}/train_labeled_features.csv")
     y = pd.read_csv(f"{data_dir}/train_labeled_labels.csv").values.ravel()
     return X.values, y
@@ -17,16 +23,14 @@ def load_labeled_data(data_dir=None):
 
 def load_unlabeled_data(data_dir=None):
     """Load unlabeled training features."""
-    if data_dir is None:
-        data_dir = DATA_DIR
+    data_dir = _resolve_data_dir(data_dir)
     X = pd.read_csv(f"{data_dir}/train_unlabeled_features.csv")
     return X.values
 
 
 def load_test_data(data_dir=None):
     """Load test features (with Id column)."""
-    if data_dir is None:
-        data_dir = DATA_DIR
+    data_dir = _resolve_data_dir(data_dir)
     df = pd.read_csv(f"{data_dir}/test_features.csv")
     ids = df["Id"].values
     X = df.drop(columns=["Id"]).values
