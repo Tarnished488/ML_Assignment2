@@ -9,11 +9,13 @@ class MLPClassifier(nn.Module):
         self,
         input_dim=512,
         num_classes=10,
-        hidden_dims=(256, 128),
+        hidden_dims=(256, 128, 64),
         dropout=0.3,
+        activation="gelu",
     ):
         super().__init__()
 
+        activation_layer = nn.GELU if activation.lower() == "gelu" else nn.ReLU
         layers = []
         prev_dim = input_dim
         for hidden_dim in hidden_dims:
@@ -21,7 +23,7 @@ class MLPClassifier(nn.Module):
                 [
                     nn.Linear(prev_dim, hidden_dim),
                     nn.BatchNorm1d(hidden_dim),
-                    nn.ReLU(),
+                    activation_layer(),
                     nn.Dropout(dropout),
                 ]
             )
@@ -34,10 +36,17 @@ class MLPClassifier(nn.Module):
         return self.net(x.float())
 
 
-def build_mlp(input_dim=512, num_classes=10, hidden_dims=(256, 128), dropout=0.3):
+def build_mlp(
+    input_dim=512,
+    num_classes=10,
+    hidden_dims=(256, 128, 64),
+    dropout=0.3,
+    activation="gelu",
+):
     return MLPClassifier(
         input_dim=input_dim,
         num_classes=num_classes,
         hidden_dims=hidden_dims,
         dropout=dropout,
+        activation=activation,
     )

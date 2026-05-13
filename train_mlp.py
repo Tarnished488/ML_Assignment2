@@ -97,12 +97,19 @@ def train_model(args, X_train, y_train, X_val, y_val, num_classes, device):
         num_classes=num_classes,
         hidden_dims=parse_hidden_dims(args.hidden_dims),
         dropout=args.dropout,
+        activation=args.activation,
     ).to(device)
 
     train_loader = make_loader(X_train, y_train, args.batch_size, shuffle=True)
     val_loader = make_loader(X_val, y_val, args.batch_size, shuffle=False)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="max",
+        factor=args.lr_factor,
+        patience=args.lr_patience,
+    )
 
     best_state = None
     best_val_acc = -1.0
@@ -113,6 +120,7 @@ def train_model(args, X_train, y_train, X_val, y_val, num_classes, device):
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_pred, _, _ = predict(model, val_loader, device)
         val_acc, val_macro_f1 = accuracy_and_macro_f1(y_val, val_pred, num_classes)
+        scheduler.step(val_acc)
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
@@ -125,7 +133,8 @@ def train_model(args, X_train, y_train, X_val, y_val, num_classes, device):
         if epoch == 1 or epoch % args.log_every == 0 or epoch == args.epochs:
             print(
                 f"Epoch {epoch:03d} | loss={train_loss:.4f} "
-                f"| val_acc={val_acc:.4f} | val_macro_f1={val_macro_f1:.4f}"
+                f"| val_acc={val_acc:.4f} | val_macro_f1={val_macro_f1:.4f} "
+                f"| lr={optimizer.param_groups[0]['lr']:.6f}"
             )
 
         if epochs_without_improvement >= args.patience:
@@ -145,7 +154,10 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--dropout", type=float, default=0.35)
-    parser.add_argument("--hidden-dims", default="256,128")
+    parser.add_argument("--hidden-dims", default="256,128,64")
+    parser.add_argument("--activation", choices=["relu", "gelu"], default="gelu")
+    parser.add_argument("--lr-factor", type=float, default=0.5)
+    parser.add_argument("--lr-patience", type=int, default=12)
     parser.add_argument("--val-size", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--patience", type=int, default=40)
