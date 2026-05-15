@@ -1,16 +1,19 @@
 import os
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
-DATA_DIR = r"C:\Users\yqy08\Desktop\数据挖掘和机器学习\Assignment\Assignment 2\comp-3027-j-assignment-2-bdic-2026"
+# Default: project_root/data/
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_DEFAULT_DATA_DIR = str(_PROJECT_ROOT / "data")
 
 
 def _resolve_data_dir(data_dir=None):
-    """Use explicit path first, then ASSIGNMENT2_DATA_DIR, then the legacy default."""
-    return data_dir or os.environ.get("ASSIGNMENT2_DATA_DIR") or DATA_DIR
+    """Use explicit path, then ASSIGNMENT2_DATA_DIR env var, then project data/."""
+    return data_dir or os.environ.get("ASSIGNMENT2_DATA_DIR") or _DEFAULT_DATA_DIR
 
 
 def load_labeled_data(data_dir=None):
