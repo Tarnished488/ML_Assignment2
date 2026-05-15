@@ -1,7 +1,4 @@
-"""Self-training pipeline: Label Propagation → MLP → iterative re-labeling.
-
-Combines graph-based pseudo-label generation with model-based refinement.
-"""
+"""Self-training helpers for iterative semi-supervised learning."""
 
 from __future__ import annotations
 
@@ -14,23 +11,7 @@ from src.ssl.label_propagation import LabelPropagationSSL
 
 
 class SelfTrainingSSL:
-    """Multi-round self-training with label propagation bootstrapping.
-
-    Round 1: Label Propagation → initial pseudo-labels → train MLP
-    Round 2+: MLP pseudo-labels on unlabeled → retrain MLP
-
-    Parameters
-    ----------
-    lp_kwargs : dict
-        Keyword arguments passed to LabelPropagationSSL.
-    mlp_relabel_threshold : float
-        Confidence threshold when the MLP re-labels unlabeled data in
-        subsequent rounds.
-    max_rounds : int
-        Total training rounds (1 = LP only, 2+ = iterative re-labeling).
-    batch_size : int
-        Batch size for MLP inference.
-    """
+    """Multi-round self-training with label propagation bootstrapping."""
 
     def __init__(
         self,
@@ -60,7 +41,7 @@ class SelfTrainingSSL:
         X_unlabeled: np.ndarray,
         device: torch.device,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Use the trained MLP to predict on unlabeled data."""
+        """Use the trained model to predict pseudo-labels on unlabeled data."""
         loader = DataLoader(
             TensorDataset(torch.tensor(X_unlabeled, dtype=torch.float32)),
             batch_size=self.batch_size,
@@ -76,6 +57,75 @@ class SelfTrainingSSL:
         confs = probs.max(axis=1)
         return preds, confs
 
+    def bootstrap_with_label_propagation(
+        self,
+        X_labeled: np.ndarray,
+        y_labeled: np.ndarray,
+        X_unlabeled: np.ndarray,
+        num_classes: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+        """Build the initial augmented set from label propagation."""
+        n_labeled = len(y_labeled)
+        X_all = np.vstack([X_labeled, X_unlabeled])
+        pseudo_labels, confidences = self.lp.propagate(X_all, y_labeled, n_labeled)
+        keep = self.lp.select_pseudo_labels(pseudo_labels, confidences, num_classes)
+
+        if keep.any():
+            X_aug = np.vstack([X_labeled, X_unlabeled[keep]])
+            y_aug = np.concatenate([y_labeled, pseudo_labels[keep]])
+            X_remaining = X_unlabeled[~keep]
+        else:
+            X_aug = X_labeled
+            y_aug = y_labeled
+            X_remaining = X_unlabeled
+
+        record = {
+            "round": 1,
+            "method": "label_propagation",
+            "added": int(keep.sum()),
+            "remaining_unlabeled": int(len(X_remaining)),
+        }
+        return X_aug, y_aug, X_remaining, record
+
+    def relabel_with_model(
+        self,
+        model: nn.Module,
+        X_labeled: np.ndarray,
+        y_labeled: np.ndarray,
+        X_unlabeled: np.ndarray,
+        device: torch.device,
+        round_idx: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+        """Relabel the remaining unlabeled pool with the current model."""
+        if len(X_unlabeled) == 0:
+            record = {
+                "round": round_idx,
+                "method": "model_relabel",
+                "added": 0,
+                "remaining_unlabeled": 0,
+            }
+            return X_labeled, y_labeled, X_unlabeled, record
+
+        preds, confs = self._mlp_pseudo_label(model, X_unlabeled, device)
+        keep = confs >= self.mlp_relabel_threshold
+
+        if keep.any():
+            X_aug = np.vstack([X_labeled, X_unlabeled[keep]])
+            y_aug = np.concatenate([y_labeled, preds[keep]])
+            X_remaining = X_unlabeled[~keep]
+        else:
+            X_aug = X_labeled
+            y_aug = y_labeled
+            X_remaining = X_unlabeled
+
+        record = {
+            "round": round_idx,
+            "method": "model_relabel",
+            "added": int(keep.sum()),
+            "remaining_unlabeled": int(len(X_remaining)),
+        }
+        return X_aug, y_aug, X_remaining, record
+
     def __call__(
         self,
         model: nn.Module,
@@ -86,33 +136,32 @@ class SelfTrainingSSL:
         num_classes: int,
         **kwargs,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Run multi-round self-training. Returns augmented training data."""
-        n_labeled = len(y_labeled)
+        """Compatibility wrapper for a simple self-training pass."""
+        X_aug, y_aug, X_remaining, record = self.bootstrap_with_label_propagation(
+            X_labeled=X_labeled,
+            y_labeled=y_labeled,
+            X_unlabeled=X_unlabeled,
+            num_classes=num_classes,
+        )
+        print(
+            f"  [SelfTraining] Round 1 done: {len(y_aug)} total samples "
+            f"(+{record['added']} pseudo-labeled)"
+        )
 
-        # ---- Round 1: Label Propagation ----
-        print("  [SelfTraining] Round 1: Label Propagation ...")
-        X_all = np.vstack([X_labeled, X_unlabeled])
-        pseudo_labels, confidences = self.lp.propagate(X_all, y_labeled, n_labeled)
-        keep = self.lp.select_pseudo_labels(pseudo_labels, confidences, num_classes)
-
-        X_aug = X_labeled
-        y_aug = y_labeled
-        if keep.any():
-            X_aug = np.vstack([X_labeled, X_unlabeled[keep]])
-            y_aug = np.concatenate([y_labeled, pseudo_labels[keep]])
-        print(f"  [SelfTraining] Round 1 done: {len(y_aug)} total samples "
-              f"(+{len(y_aug) - n_labeled} pseudo-labeled)")
-
-        # ---- Rounds 2+: MLP-based re-labeling ----
         for rnd in range(2, self.max_rounds + 1):
-            print(f"  [SelfTraining] Round {rnd}: MLP pseudo-labeling ...")
-            mlp_preds, mlp_confs = self._mlp_pseudo_label(model, X_unlabeled, device)
-            mlp_keep = mlp_confs >= self.mlp_relabel_threshold
-
-            if mlp_keep.any():
-                X_aug = np.vstack([X_labeled, X_unlabeled[mlp_keep]])
-                y_aug = np.concatenate([y_labeled, mlp_preds[mlp_keep]])
-            print(f"  [SelfTraining] Round {rnd} done: {len(y_aug)} total "
-                  f"({int(mlp_keep.sum())} pseudo-labeled at conf≥{self.mlp_relabel_threshold})")
+            X_aug, y_aug, X_remaining, record = self.relabel_with_model(
+                model=model,
+                X_labeled=X_aug,
+                y_labeled=y_aug,
+                X_unlabeled=X_remaining,
+                device=device,
+                round_idx=rnd,
+            )
+            print(
+                f"  [SelfTraining] Round {rnd} done: {len(y_aug)} total "
+                f"({record['added']} pseudo-labeled at conf>={self.mlp_relabel_threshold})"
+            )
+            if record["added"] == 0:
+                break
 
         return X_aug, y_aug

@@ -15,9 +15,11 @@ Usage:
 """
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,6 +33,7 @@ from src.preprocessing.data_loader import (
 )
 from src.ssl.consistency import CombinedSSLLoss
 from src.ssl.label_propagation import LabelPropagationSSL
+from src.ssl.self_training import SelfTrainingSSL
 from src.visualization.visualizer import (
     plot_confusion_matrix,
     plot_decision_boundary,
@@ -432,6 +435,115 @@ def generate_visualizations(model, history, X_train, y_train, X_val, y_val,
     print("Visualizations done.")
 
 
+def build_model(input_dim, num_classes, args, device):
+    hidden_dims = tuple(int(x.strip()) for x in args.hidden_dims.split(","))
+    model = build_mlp(
+        input_dim=input_dim,
+        num_classes=num_classes,
+        hidden_dims=hidden_dims,
+        dropout=args.dropout,
+        activation=args.activation,
+        use_residual=True,
+        norm=args.norm,
+    ).to(device)
+    print(
+        f"\nModel: MLP{hidden_dims} | residual=True | norm={args.norm} | "
+        f"activation={args.activation} | params={sum(p.numel() for p in model.parameters()):,}"
+    )
+    return model
+
+
+def train_self_training(
+    X_train_raw,
+    y_train,
+    X_val_raw,
+    y_val,
+    X_unlabeled,
+    num_classes,
+    device,
+    args,
+):
+    """Run iterative self-training and return the final trained model."""
+    ssl = SelfTrainingSSL(
+        lp_kwargs=dict(
+            n_neighbors=args.lp_k,
+            alpha=args.lp_alpha,
+            class_balanced=True,
+            top_k_per_class=args.lp_top_k,
+            confidence_threshold=args.lp_conf,
+        ),
+        mlp_relabel_threshold=args.self_train_threshold,
+        max_rounds=args.self_train_rounds,
+        batch_size=args.batch_size,
+    )
+
+    round_summaries = []
+    X_current, y_current, X_remaining, first_round = ssl.bootstrap_with_label_propagation(
+        X_labeled=X_train_raw,
+        y_labeled=y_train,
+        X_unlabeled=X_unlabeled,
+        num_classes=num_classes,
+    )
+    round_summaries.append(first_round)
+    print(
+        f"  [SelfTraining] Round 1/{args.self_train_rounds}: "
+        f"+{first_round['added']} pseudo-labeled, "
+        f"remaining_unlabeled={first_round['remaining_unlabeled']}"
+    )
+
+    model = None
+    history = None
+    best_epoch = 0
+    best_val_acc = -1.0
+    best_val_f1 = -1.0
+
+    for round_idx in range(1, args.self_train_rounds + 1):
+        model = build_model(X_current.shape[1], num_classes, args, device)
+        stage_name = f"self_train_r{round_idx}"
+        unlabeled_for_vat = X_remaining if args.use_vat and len(X_remaining) > 0 else None
+        model, history, best_epoch, best_val_acc, best_val_f1 = train_standard(
+            model,
+            X_current,
+            y_current,
+            X_val_raw,
+            y_val,
+            device,
+            args,
+            stage_name=stage_name,
+            X_unlabeled=unlabeled_for_vat,
+        )
+        print(
+            f"  [SelfTraining] Round {round_idx} val_acc={best_val_acc:.4f} "
+            f"macro_f1={best_val_f1:.4f}"
+        )
+        round_summaries[-1]["train_size"] = int(len(y_current))
+        round_summaries[-1]["best_epoch"] = int(best_epoch)
+        round_summaries[-1]["best_val_acc"] = float(best_val_acc)
+        round_summaries[-1]["best_val_macro_f1"] = float(best_val_f1)
+
+        if round_idx >= args.self_train_rounds or len(X_remaining) == 0:
+            break
+
+        X_current, y_current, X_remaining, record = ssl.relabel_with_model(
+            model=model,
+            X_labeled=X_current,
+            y_labeled=y_current,
+            X_unlabeled=X_remaining,
+            device=device,
+            round_idx=round_idx + 1,
+        )
+        round_summaries.append(record)
+        print(
+            f"  [SelfTraining] Round {round_idx + 1}/{args.self_train_rounds}: "
+            f"+{record['added']} pseudo-labeled, "
+            f"remaining_unlabeled={record['remaining_unlabeled']}"
+        )
+        if record["added"] == 0:
+            break
+
+    return model, history, best_epoch, best_val_acc, best_val_f1, X_current, y_current, round_summaries
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -466,12 +578,14 @@ def main():
 
     # SSL
     parser.add_argument("--use-ssl", action="store_true")
-    parser.add_argument("--ssl-method", choices=["distill", "pseudo"],
+    parser.add_argument("--ssl-method", choices=["distill", "pseudo", "self_training"],
                         default="distill")
     parser.add_argument("--lp-k", type=int, default=10)
     parser.add_argument("--lp-alpha", type=float, default=0.99)
     parser.add_argument("--lp-top-k", type=int, default=300)
     parser.add_argument("--lp-conf", type=float, default=0.6)
+    parser.add_argument("--self-train-rounds", type=int, default=3)
+    parser.add_argument("--self-train-threshold", type=float, default=0.85)
 
     # Distillation
     parser.add_argument("--distill-T", type=float, default=2.0,
@@ -516,8 +630,9 @@ def main():
     X_train_ssl = X_train_raw
     y_train_ssl = y_train
     lp_soft = None  # soft probabilities for distillation
+    self_training_rounds = None
 
-    if args.use_ssl:
+    if args.use_ssl and args.ssl_method in {"distill", "pseudo"}:
         lp = LabelPropagationSSL(
             n_neighbors=args.lp_k,
             alpha=args.lp_alpha,
@@ -557,19 +672,23 @@ def main():
     # ------------------------------------------------------------------
     # 3. Build model and train
     # ------------------------------------------------------------------
-    hidden_dims = tuple(int(x.strip()) for x in args.hidden_dims.split(","))
-    model = build_mlp(
-        input_dim=X_train_ssl.shape[1],
-        num_classes=num_classes,
-        hidden_dims=hidden_dims,
-        dropout=args.dropout,
-        activation=args.activation,
-        use_residual=True,
-        norm=args.norm,
-    ).to(device)
-
-    print(f"\nModel: MLP{hidden_dims} | residual=True | norm={args.norm} | "
-          f"activation={args.activation} | params={sum(p.numel() for p in model.parameters()):,}")
+    if args.use_ssl and args.ssl_method == "self_training":
+        print(
+            "Training: Self-Training | "
+            f"rounds={args.self_train_rounds} | threshold={args.self_train_threshold}"
+        )
+        model, history, best_epoch, best_val_acc, best_val_f1, X_train_ssl, y_train_ssl, self_training_rounds = train_self_training(
+            X_train_raw,
+            y_train,
+            X_val_raw,
+            y_val,
+            X_unlabeled,
+            num_classes,
+            device,
+            args,
+        )
+    else:
+        model = build_model(X_train_ssl.shape[1], num_classes, args, device)
 
     if args.use_ssl and args.ssl_method == "distill" and lp_soft is not None:
         print(f"Training: Knowledge Distillation | T={args.distill_T} | alpha={args.distill_alpha}")
@@ -577,7 +696,7 @@ def main():
             model, X_train_ssl, y_train_ssl, lp_soft, X_unlabeled,
             X_val_raw, y_val, device, args,
         )
-    else:
+    elif not (args.use_ssl and args.ssl_method == "self_training"):
         unlabeled_for_vat = X_unlabeled if args.use_vat else None
         model, history, best_epoch, best_val_acc, best_val_f1 = train_standard(
             model, X_train_ssl, y_train_ssl, X_val_raw, y_val, device, args,
@@ -600,7 +719,6 @@ def main():
     test_labels = classes[test_pred]
 
     sub_path = out / "submission.csv"
-    import pandas as pd
     pd.DataFrame({"Id": test_ids, "Category": test_labels}).to_csv(sub_path, index=False)
     print(f"Submission saved -> {sub_path}")
 
@@ -610,6 +728,28 @@ def main():
 
     # Save model
     torch.save(model.state_dict(), out / "model.pt")
+
+    val_loader = make_loader(X_val_raw, y_val, args.batch_size, shuffle=False)
+    val_pred, _, _ = predict(model, val_loader, device)
+    final_val_metrics = compute_metrics(y_val, val_pred)
+
+    metrics = {
+        "name": args.name,
+        "ssl_enabled": bool(args.use_ssl),
+        "ssl_method": args.ssl_method if args.use_ssl else "supervised",
+        "best_epoch": int(best_epoch),
+        "best_val_acc": float(best_val_acc),
+        "best_val_macro_f1": float(best_val_f1),
+        "final_val_metrics": final_val_metrics,
+        "train_size_final": int(len(y_train_ssl)),
+        "pseudo_labels_added": int(len(y_train_ssl) - len(y_train)),
+    }
+    if self_training_rounds is not None:
+        metrics["self_training_rounds"] = self_training_rounds
+
+    metrics_path = out / "metrics.json"
+    metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    print(f"Metrics saved -> {metrics_path}")
 
     # Class distribution summary
     unique, counts = np.unique(test_labels, return_counts=True)
