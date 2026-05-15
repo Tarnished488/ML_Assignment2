@@ -6,9 +6,9 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
-# Default: project_root/data/
+# Default: user-provided assignment dataset directory.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-_DEFAULT_DATA_DIR = str(_PROJECT_ROOT / "data")
+_DEFAULT_DATA_DIR = r"C:\Users\yqy08\Desktop\数据挖掘和机器学习\Assignment\Assignment 2\comp-3027-j-assignment-2-bdic-2026"
 
 
 def _resolve_data_dir(data_dir=None):

@@ -259,9 +259,19 @@ def plot_loss_landscape(
         rand_b = torch.randn_like(p)
         # Filter-normalise: scale each filter to match the centre param norm
         if p.dim() >= 2:  # weight matrix / conv filter
-            norm_centre = p.norm(dim=-1, keepdim=True) if p.dim() == 2 else p.norm(dim=(1, 2, 3), keepdim=True)
-            norm_a = rand_a.norm(dim=-1, keepdim=True) if p.dim() == 2 else rand_a.norm(dim=(1, 2, 3), keepdim=True)
-            norm_b = rand_b.norm(dim=-1, keepdim=True) if p.dim() == 2 else rand_b.norm(dim=(1, 2, 3), keepdim=True)
+            # Flatten each output filter/row and compute a vector norm so the
+            # logic works for both linear weights [out, in] and conv weights
+            # [out, in, kH, kW] across PyTorch versions.
+            flat_shape = (p.shape[0], -1)
+            norm_centre = torch.linalg.vector_norm(
+                p.reshape(flat_shape), dim=1, keepdim=True
+            ).reshape((p.shape[0],) + (1,) * (p.dim() - 1))
+            norm_a = torch.linalg.vector_norm(
+                rand_a.reshape(flat_shape), dim=1, keepdim=True
+            ).reshape((p.shape[0],) + (1,) * (p.dim() - 1))
+            norm_b = torch.linalg.vector_norm(
+                rand_b.reshape(flat_shape), dim=1, keepdim=True
+            ).reshape((p.shape[0],) + (1,) * (p.dim() - 1))
             rand_a = rand_a / (norm_a + 1e-10) * (norm_centre + 1e-10)
             rand_b = rand_b / (norm_b + 1e-10) * (norm_centre + 1e-10)
         direction_a[name] = rand_a

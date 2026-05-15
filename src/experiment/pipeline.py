@@ -31,6 +31,8 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from src.preprocessing.data_loader import get_train_val_split, load_test_data, load_unlabeled_data
 
+DEFAULT_DATA_DIR = r"C:\Users\yqy08\Desktop\数据挖掘和机器学习\Assignment\Assignment 2\comp-3027-j-assignment-2-bdic-2026"
+
 # ---------------------------------------------------------------------------
 # Type aliases
 # ---------------------------------------------------------------------------
@@ -95,7 +97,7 @@ class ExperimentConfig:
     output_dir: str = "outputs"
 
     # --- Data ---
-    data_dir: Optional[str] = None
+    data_dir: Optional[str] = DEFAULT_DATA_DIR
     val_size: float = 0.2
 
     # --- Model ---

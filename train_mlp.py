@@ -17,6 +17,7 @@ Usage:
 import argparse
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -25,6 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
+from src.models.cnn import build_cnn_32x16, build_cnn_8x64
 from src.models.mlp import build_mlp
 from src.preprocessing.data_loader import (
     get_train_val_split,
@@ -436,20 +438,41 @@ def generate_visualizations(model, history, X_train, y_train, X_val, y_val,
 
 
 def build_model(input_dim, num_classes, args, device):
-    hidden_dims = tuple(int(x.strip()) for x in args.hidden_dims.split(","))
-    model = build_mlp(
-        input_dim=input_dim,
-        num_classes=num_classes,
-        hidden_dims=hidden_dims,
-        dropout=args.dropout,
-        activation=args.activation,
-        use_residual=True,
-        norm=args.norm,
-    ).to(device)
-    print(
-        f"\nModel: MLP{hidden_dims} | residual=True | norm={args.norm} | "
-        f"activation={args.activation} | params={sum(p.numel() for p in model.parameters()):,}"
-    )
+    if args.model_type == "mlp":
+        hidden_dims = tuple(int(x.strip()) for x in args.hidden_dims.split(","))
+        model = build_mlp(
+            input_dim=input_dim,
+            num_classes=num_classes,
+            hidden_dims=hidden_dims,
+            dropout=args.dropout,
+            activation=args.activation,
+            use_residual=True,
+            norm=args.norm,
+        ).to(device)
+        model_desc = (
+            f"MLP{hidden_dims} | residual=True | norm={args.norm} | "
+            f"activation={args.activation}"
+        )
+    elif args.model_type == "cnn":
+        cnn_builders = {
+            "32x16": build_cnn_32x16,
+            "8x64": build_cnn_8x64,
+        }
+        model = cnn_builders[args.cnn_layout](
+            input_dim=input_dim,
+            num_classes=num_classes,
+            conv1_channels=args.cnn_conv1_channels,
+            conv2_channels=args.cnn_conv2_channels,
+            hidden_dim=args.cnn_hidden_dim,
+        ).to(device)
+        model_desc = (
+            f"CNN[{args.cnn_layout}] | conv=({args.cnn_conv1_channels},{args.cnn_conv2_channels}) | "
+            f"hidden={args.cnn_hidden_dim}"
+        )
+    else:
+        raise ValueError(f"Unsupported model_type: {args.model_type}")
+
+    print(f"\nModel: {model_desc} | params={sum(p.numel() for p in model.parameters()):,}")
     return model
 
 
@@ -544,71 +567,19 @@ def train_self_training(
     return model, history, best_epoch, best_val_acc, best_val_f1, X_current, y_current, round_summaries
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def make_experiment_name(args):
+    base = args.base_name if getattr(args, "base_name", None) else args.name
+    model_part = args.model_type if args.model_type == "mlp" else f"cnn_{args.cnn_layout}"
+    ssl_part = args.ssl_method if args.use_ssl else "supervised"
+    return f"{base}_{model_part}_{ssl_part}"
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Train MLP with SSL + visualizations.")
-
-    # Experiment
-    parser.add_argument("--name", default="mlp_ssl")
-    parser.add_argument("--group", default="Group_XX")
-    parser.add_argument("--output-dir", default="outputs")
-
-    # Data
-    parser.add_argument("--data-dir", default=None)
-    parser.add_argument("--val-size", type=float, default=0.2)
-
-    # Model
-    parser.add_argument("--hidden-dims", default="256,128,64")
-    parser.add_argument("--dropout", type=float, default=0.3)
-    parser.add_argument("--activation", choices=["relu", "gelu", "silu"], default="gelu")
-    parser.add_argument("--norm", choices=["batch", "layer"], default="batch")
-
-    # Training
-    parser.add_argument("--epochs", type=int, default=300)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--lr-factor", type=float, default=0.5)
-    parser.add_argument("--lr-patience", type=int, default=15)
-    parser.add_argument("--patience", type=int, default=50)
-
-    # SSL
-    parser.add_argument("--use-ssl", action="store_true")
-    parser.add_argument("--ssl-method", choices=["distill", "pseudo", "self_training"],
-                        default="distill")
-    parser.add_argument("--lp-k", type=int, default=10)
-    parser.add_argument("--lp-alpha", type=float, default=0.99)
-    parser.add_argument("--lp-top-k", type=int, default=300)
-    parser.add_argument("--lp-conf", type=float, default=0.6)
-    parser.add_argument("--self-train-rounds", type=int, default=3)
-    parser.add_argument("--self-train-threshold", type=float, default=0.85)
-
-    # Distillation
-    parser.add_argument("--distill-T", type=float, default=2.0,
-                        help="Temperature for softening logits in KD")
-    parser.add_argument("--distill-alpha", type=float, default=5.0,
-                        help="Weight for KD loss relative to CE")
-
-    # VAT
-    parser.add_argument("--use-vat", action="store_true")
-    parser.add_argument("--vat-weight", type=float, default=0.3)
-    parser.add_argument("--pi-weight", type=float, default=0.1)
-    parser.add_argument("--vat-epsilon", type=float, default=2.0)
-    parser.add_argument("--vat-rampup", type=int, default=50)
-
-    # Misc
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--log-every", type=int, default=10)
-    parser.add_argument("--no-viz", action="store_true")
-
-    args = parser.parse_args()
+def run_single_experiment(args, device):
     set_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    args.name = make_experiment_name(args)
+    print(f"\n{'#' * 72}")
+    print(f"Running: {args.name}")
+    print(f"{'#' * 72}")
 
     # ------------------------------------------------------------------
     # 1. Load data
@@ -735,6 +706,8 @@ def main():
 
     metrics = {
         "name": args.name,
+        "model_type": args.model_type,
+        "cnn_layout": args.cnn_layout if args.model_type == "cnn" else None,
         "ssl_enabled": bool(args.use_ssl),
         "ssl_method": args.ssl_method if args.use_ssl else "supervised",
         "best_epoch": int(best_epoch),
@@ -765,6 +738,120 @@ def main():
         )
 
     print(f"\nDone. Outputs in {out}/")
+    return metrics
+
+
+def planned_experiments(args):
+    configs = []
+    model_variants = [
+        ("mlp", None),
+        ("cnn", "32x16"),
+        ("cnn", "8x64"),
+    ]
+    ssl_variants = [
+        (False, "supervised"),
+        (True, "pseudo"),
+        (True, "distill"),
+        (True, "self_training"),
+    ]
+
+    for model_type, cnn_layout in model_variants:
+        for use_ssl, ssl_method in ssl_variants:
+            run_args = SimpleNamespace(**vars(args))
+            run_args.model_type = model_type
+            run_args.cnn_layout = cnn_layout or args.cnn_layout
+            run_args.use_ssl = use_ssl
+            run_args.ssl_method = ssl_method if use_ssl else args.ssl_method
+            configs.append(run_args)
+    return configs
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train all model/SSL combinations.")
+
+    # Experiment
+    parser.add_argument("--name", default="all_models")
+    parser.add_argument("--group", default="Group_XX")
+    parser.add_argument("--output-dir", default="outputs")
+
+    # Data
+    parser.add_argument(
+        "--data-dir",
+        default=r"C:\Users\yqy08\Desktop\数据挖掘和机器学习\Assignment\Assignment 2\comp-3027-j-assignment-2-bdic-2026",
+    )
+    parser.add_argument("--val-size", type=float, default=0.2)
+
+    # Model
+    parser.add_argument("--model-type", choices=["mlp", "cnn"], default="mlp")
+    parser.add_argument("--hidden-dims", default="256,128,64")
+    parser.add_argument("--dropout", type=float, default=0.3)
+    parser.add_argument("--activation", choices=["relu", "gelu", "silu"], default="gelu")
+    parser.add_argument("--norm", choices=["batch", "layer"], default="batch")
+    parser.add_argument("--cnn-layout", choices=["32x16", "8x64"], default="32x16")
+    parser.add_argument("--cnn-conv1-channels", type=int, default=8)
+    parser.add_argument("--cnn-conv2-channels", type=int, default=16)
+    parser.add_argument("--cnn-hidden-dim", type=int, default=128)
+
+    # Training
+    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--lr-factor", type=float, default=0.5)
+    parser.add_argument("--lr-patience", type=int, default=15)
+    parser.add_argument("--patience", type=int, default=50)
+
+    # SSL
+    parser.add_argument("--use-ssl", action="store_true")
+    parser.add_argument("--ssl-method", choices=["distill", "pseudo", "self_training"],
+                        default="distill")
+    parser.add_argument("--lp-k", type=int, default=10)
+    parser.add_argument("--lp-alpha", type=float, default=0.99)
+    parser.add_argument("--lp-top-k", type=int, default=300)
+    parser.add_argument("--lp-conf", type=float, default=0.6)
+    parser.add_argument("--self-train-rounds", type=int, default=3)
+    parser.add_argument("--self-train-threshold", type=float, default=0.85)
+
+    # Distillation
+    parser.add_argument("--distill-T", type=float, default=2.0,
+                        help="Temperature for softening logits in KD")
+    parser.add_argument("--distill-alpha", type=float, default=5.0,
+                        help="Weight for KD loss relative to CE")
+
+    # VAT
+    parser.add_argument("--use-vat", action="store_true")
+    parser.add_argument("--vat-weight", type=float, default=0.3)
+    parser.add_argument("--pi-weight", type=float, default=0.1)
+    parser.add_argument("--vat-epsilon", type=float, default=2.0)
+    parser.add_argument("--vat-rampup", type=int, default=50)
+
+    # Misc
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument("--no-viz", action="store_true")
+
+    args = parser.parse_args()
+    args.base_name = args.name
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    all_metrics = []
+    for run_args in planned_experiments(args):
+        metrics = run_single_experiment(run_args, device)
+        all_metrics.append(metrics)
+
+    summary_dir = Path(args.output_dir) / args.base_name
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = summary_dir / "summary.csv"
+    pd.DataFrame(all_metrics).sort_values(
+        by=["best_val_acc", "best_val_macro_f1"], ascending=False
+    ).to_csv(summary_path, index=False)
+    print(f"\nSummary saved -> {summary_path}")
 
 
 if __name__ == "__main__":
