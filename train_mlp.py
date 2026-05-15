@@ -32,10 +32,12 @@ from src.preprocessing.data_loader import (
     get_train_val_split,
     load_test_data,
     load_unlabeled_data,
+    _resolve_data_dir,
 )
 from src.ssl.consistency import CombinedSSLLoss
 from src.ssl.label_propagation import LabelPropagationSSL
 from src.ssl.self_training import SelfTrainingSSL
+from src.utils import compute_metrics, encode_labels, make_loader, predict, set_seed
 from src.visualization.visualizer import (
     plot_confusion_matrix,
     plot_decision_boundary,
@@ -44,68 +46,6 @@ from src.visualization.visualizer import (
     plot_training_curves,
     plot_tsne,
 )
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def set_seed(seed: int):
-    import random
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-def encode_labels(y_raw):
-    classes = np.array(sorted(np.unique(y_raw)))
-    class_to_idx = {c: i for i, c in enumerate(classes)}
-    encoded = np.array([class_to_idx[c] for c in y_raw], dtype=np.int64)
-    return encoded, classes, class_to_idx
-
-
-def make_loader(X, y=None, batch_size=32, shuffle=False):
-    X_t = torch.tensor(X, dtype=torch.float32)
-    if y is None:
-        return DataLoader(TensorDataset(X_t), batch_size=batch_size, shuffle=shuffle)
-    return DataLoader(
-        TensorDataset(X_t, torch.tensor(y, dtype=torch.long)),
-        batch_size=batch_size,
-        shuffle=shuffle,
-    )
-
-
-def compute_metrics(y_true, y_pred):
-    from sklearn.metrics import (
-        accuracy_score,
-        f1_score,
-        precision_score,
-        recall_score,
-    )
-    return {
-        "accuracy": float(accuracy_score(y_true, y_pred)),
-        "macro_f1": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
-        "weighted_f1": float(f1_score(y_true, y_pred, average="weighted", zero_division=0)),
-        "macro_precision": float(precision_score(y_true, y_pred, average="macro", zero_division=0)),
-        "macro_recall": float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
-    }
-
-
-@torch.no_grad()
-def predict(model, loader, device):
-    model.eval()
-    all_logits = []
-    for batch in loader:
-        all_logits.append(model(batch[0].to(device)).cpu())
-    logits = torch.cat(all_logits, dim=0)
-    probs = torch.softmax(logits, dim=1).numpy()
-    preds = probs.argmax(axis=1)
-    confs = probs.max(axis=1)
-    return preds, confs, probs
 
 
 # ---------------------------------------------------------------------------
@@ -782,7 +722,7 @@ def main():
     # Data
     parser.add_argument(
         "--data-dir",
-        default=r"C:\Users\yqy08\Desktop\数据挖掘和机器学习\Assignment\Assignment 2\comp-3027-j-assignment-2-bdic-2026",
+        default=_resolve_data_dir(),
     )
     parser.add_argument("--val-size", type=float, default=0.2)
 

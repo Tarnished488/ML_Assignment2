@@ -36,13 +36,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-# ---------------------------------------------------------------------------
-# Default data directory
-# ---------------------------------------------------------------------------
-DEFAULT_DATA_DIR = (
-    r"C:\Users\yqy08\Desktop\数据挖掘和机器学习\Assignment\Assignment 2"
-    r"\comp-3027-j-assignment-2-bdic-2026"
-)
+from src.preprocessing.data_loader import _resolve_data_dir
 
 # ---------------------------------------------------------------------------
 # Parameter search spaces
@@ -337,7 +331,7 @@ Examples:
 
     # Experiment
     parser.add_argument("--output-dir", default="outputs/tuning")
-    parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
+    parser.add_argument("--data-dir", default=_resolve_data_dir())
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--timeout", type=int, default=1800,
                         help="Max seconds per trial")
