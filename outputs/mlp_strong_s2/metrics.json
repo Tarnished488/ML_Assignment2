@@ -1,0 +1,17 @@
+{
+  "name": "mlp_strong_s2",
+  "ssl_enabled": true,
+  "ssl_method": "distill",
+  "best_epoch": 44,
+  "best_val_acc": 0.5333333333333333,
+  "best_val_macro_f1": 0.5333333333333333,
+  "final_val_metrics": {
+    "accuracy": 0.5333333333333333,
+    "macro_f1": 0.5333333333333333,
+    "weighted_f1": 0.5333333333333333,
+    "macro_precision": 0.575,
+    "macro_recall": 0.55
+  },
+  "train_size_final": 116,
+  "pseudo_labels_added": 31
+}
