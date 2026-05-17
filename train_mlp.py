@@ -142,7 +142,28 @@ def train_model(args, X_train, y_train, X_val, y_val, num_classes, device):
             break
 
     model.load_state_dict(best_state)
-    return model, best_val_acc
+    return model, best_val_acc, best_epoch
+
+
+def train_fixed_epochs(args, X_train, y_train, num_classes, device, epochs):
+    model = build_mlp(
+        input_dim=X_train.shape[1],
+        num_classes=num_classes,
+        hidden_dims=parse_hidden_dims(args.hidden_dims),
+        dropout=args.dropout,
+        activation=args.activation,
+    ).to(device)
+
+    train_loader = make_loader(X_train, y_train, args.batch_size, shuffle=True)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    for epoch in range(1, epochs + 1):
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        if epoch == 1 or epoch % args.log_every == 0 or epoch == epochs:
+            print(f"Final refit epoch {epoch:03d} | loss={train_loss:.4f}")
+
+    return model
 
 
 def main():
@@ -162,6 +183,11 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--patience", type=int, default=40)
     parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument(
+        "--skip-final-refit",
+        action="store_true",
+        help="Skip retraining the selected model on all labeled data before submission.",
+    )
     
     # ======= 成员 C 的半监督调参战场 =======
     parser.add_argument("--use-pseudo-labels", action="store_true", default=True, help="是否启用半监督")
@@ -197,6 +223,9 @@ def main():
     # 2. 开启成员 C 的多轮滚动迭代自训练（Iterative Self-training）
     best_overall_model = None
     best_overall_val_acc = -1.0
+    best_overall_epoch = args.epochs
+    best_refit_X = None
+    best_refit_y = None
 
     max_rounds = args.max_rounds if args.use_pseudo_labels else 1
 
@@ -207,7 +236,7 @@ def main():
         print(f"当前训练集样本总数（含已并入的伪标签）: {X_labeled_current.shape[0]}")
 
         # 训练当前轮次的模型（调用 B 的复杂模型和训练流）
-        model, current_val_acc = train_model(
+        model, current_val_acc, current_best_epoch = train_model(
             args, X_labeled_current, y_labeled_current, X_val, y_val, num_classes, device
         )
         print(f"✨ Round {round_idx} 完成！验证集 Accuracy = {current_val_acc:.4f}")
@@ -216,6 +245,9 @@ def main():
         if current_val_acc > best_overall_val_acc:
             best_overall_val_acc = current_val_acc
             best_overall_model = model
+            best_overall_epoch = current_best_epoch
+            best_refit_X = np.vstack([X_labeled_current, X_val])
+            best_refit_y = np.concatenate([y_labeled_current, y_val])
 
         # 如果到了最后一轮，或者不开启半监督，直接退出循环
         if round_idx == max_rounds or not args.use_pseudo_labels:
@@ -250,6 +282,21 @@ def main():
         print(f"👉 成功合并！下一轮(Round {round_idx + 1}) 的训练集规模将扩大至: {X_labeled_current.shape[0]}条")
 
     print(f"\n🏁 半监督滚动全流程结束！历史最高验证集准确率: {best_overall_val_acc:.4f}")
+
+    if not args.skip_final_refit:
+        print(
+            "\nRefitting final model on all labeled data "
+            f"(plus accepted pseudo-labels from the best round): {best_refit_X.shape[0]} samples, "
+            f"{best_overall_epoch} epochs."
+        )
+        best_overall_model = train_fixed_epochs(
+            args,
+            best_refit_X,
+            best_refit_y,
+            num_classes,
+            device,
+            epochs=best_overall_epoch,
+        )
 
     # 7. 导出预测用于 Kaggle 提交（自动使用历史表现最好的模型权重）
     print("\n正在读取测试集并用最优半监督模型生成 Kaggle 提交文件...")
