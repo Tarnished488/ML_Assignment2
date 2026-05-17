@@ -93,6 +93,7 @@ def main():
     else:
         final_preds = soft_voting(all_probs, args.weights)
 
+    # final_preds are already 0..K-1 integers from argmax
     unique, counts = np.unique(final_preds, return_counts=True)
     print(f"\nEnsemble ({args.method}): {dict(zip(unique, counts))}")
 

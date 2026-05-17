@@ -24,6 +24,7 @@ Output:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import json
 import subprocess
@@ -87,7 +88,18 @@ PRESETS: dict[str, dict[str, Any]] = {
         "self_train_threshold": [0.75, 0.80, 0.85, 0.90, 0.95],
     },
 
-    # ── Combined — the top-8 most impactful params (for random search) ──
+    # ── ST fine-tuning (threshold + LP interaction) ─────────────────
+    # Self-adaptive: per-class thresholds + curriculum decay per round.
+    # Literature (FreeMatch/PabLO 2024): fixed 0.95 is suboptimal;
+    # per-class adaptive + curriculum → 5-11% improvement.
+    "st_finetune": {
+        "self_train_rounds": [3, 4, 5],
+        "self_train_threshold": [0.70, 0.75, 0.80, 0.85, 0.90, 0.95],
+        "lp_conf": [0.4, 0.5, 0.6, 0.7],
+        "lp_top_k": [200, 300, 400, 500],
+    },
+
+    # ── Combined — top-12 most impactful params (for random search) ──
     "combined": {
         "lr": [1e-4, 3e-4, 5e-4, 1e-3, 3e-3],
         "dropout": [0.2, 0.3, 0.4, 0.5, 0.6],
@@ -99,6 +111,8 @@ PRESETS: dict[str, dict[str, Any]] = {
         "distill_alpha": [1.0, 3.0, 5.0, 10.0, 20.0],
         "vat_weight": [0.1, 0.2, 0.3, 0.5],
         "vat_epsilon": [1.0, 2.0, 4.0, 6.0],
+        "self_train_rounds": [3, 4, 5],
+        "self_train_threshold": [0.75, 0.80, 0.85, 0.90, 0.95],
     },
 }
 
@@ -162,6 +176,7 @@ def build_command(trial_cfg: dict[str, Any], ssl_method: str, data_dir: str) -> 
     cmd = [
         sys.executable, "train_mlp.py",
         "--data-dir", data_dir,
+        "--models", "mlp",
         "--use-ssl",
         "--ssl-method", ssl_method,
         "--no-viz",
@@ -190,6 +205,7 @@ def build_command(trial_cfg: dict[str, Any], ssl_method: str, data_dir: str) -> 
         "patience": "--patience",
         "lr_factor": "--lr-factor",
         "lr_patience": "--lr-patience",
+        "seed": "--seed",
     }
 
     for key, value in trial_cfg.items():
@@ -204,10 +220,82 @@ def build_command(trial_cfg: dict[str, Any], ssl_method: str, data_dir: str) -> 
     return cmd
 
 
-def trial_name(idx: int, trial_cfg: dict[str, Any]) -> str:
-    """Short readable directory name for a trial."""
+def compact_trial_name(
+    idx: int,
+    trial_cfg: dict[str, Any],
+    search_keys: set[str] | None = None,
+) -> str:
+    """Compact readable directory name that stays under Windows path limits."""
+    if search_keys is None:
+        search_keys = set(trial_cfg)
+
+    aliases = {
+        "activation": "act",
+        "batch_size": "bs",
+        "distill_T": "T",
+        "distill_alpha": "da",
+        "dropout": "do",
+        "epochs": "ep",
+        "hidden_dims": "hd",
+        "lp_alpha": "lpa",
+        "lp_conf": "lpc",
+        "lp_k": "lpk",
+        "lp_top_k": "lpt",
+        "lr": "lr",
+        "lr_factor": "lrf",
+        "lr_patience": "lrp",
+        "norm": "nm",
+        "patience": "pat",
+        "seed": "sd",
+        "self_train_rounds": "str",
+        "self_train_threshold": "stt",
+        "vat_epsilon": "ve",
+        "vat_weight": "vw",
+        "weight_decay": "wd",
+    }
+
+    def format_value(value: Any) -> str:
+        if isinstance(value, float):
+            return f"{value:.4g}"
+        if isinstance(value, str):
+            return value.replace(",", "x")
+        return str(value)
+
+    compact_parts = []
+    for key in sorted(search_keys):
+        if key not in trial_cfg:
+            continue
+        compact_parts.append(f"{aliases.get(key, key)}{format_value(trial_cfg[key])}")
+
+    signature = "|".join(
+        f"{key}={format_value(trial_cfg[key])}"
+        for key in sorted(search_keys)
+        if key in trial_cfg
+    )
+    digest = hashlib.sha1(signature.encode("utf-8")).hexdigest()[:8]
+    return f"trial{idx:03d}_{'_'.join(compact_parts)}_{digest}"
+
+
+def experiment_dir(
+    output_dir: Path,
+    idx: int,
+    trial_cfg: dict[str, Any],
+    ssl_method: str,
+    search_keys: set[str] | None = None,
+) -> Path:
+    """Resolve the train_mlp output directory for a trial."""
+    return output_dir / f"{compact_trial_name(idx, trial_cfg, search_keys)}_mlp_{ssl_method}"
+
+
+def trial_name(idx: int, trial_cfg: dict[str, Any], search_keys: set[str] | None = None) -> str:
+    """Short readable directory name — only includes searched-over params."""
+    if search_keys is None:
+        search_keys = set(trial_cfg)  # fallback: all keys
     parts = [f"trial{idx:03d}"]
-    for k, v in sorted(trial_cfg.items()):
+    for k in sorted(search_keys):
+        if k not in trial_cfg:
+            continue
+        v = trial_cfg[k]
         if isinstance(v, float):
             parts.append(f"{k}={v:.4g}")
         else:
@@ -221,14 +309,27 @@ def run_trial(
     output_dir: Path,
     ssl_method: str,
     data_dir: str,
+    search_keys: set[str] | None = None,
     timeout: int = 1800,
 ) -> dict[str, Any] | None:
     """Run a single trial.  Returns metrics dict or None on failure."""
-    tdir = output_dir / trial_name(idx, trial_cfg)
-    if (tdir / "metrics.json").exists():
+    tdir = output_dir / compact_trial_name(idx, trial_cfg, search_keys)
+    exp_dir = experiment_dir(output_dir, idx, trial_cfg, ssl_method, search_keys)
+    metrics_path = exp_dir / "metrics.json"
+    legacy_exp_dir = output_dir / f"{trial_name(idx, trial_cfg, search_keys)}_mlp_{ssl_method}"
+    if not metrics_path.exists() and legacy_exp_dir != exp_dir:
+        legacy_metrics_path = legacy_exp_dir / "metrics.json"
+        if legacy_metrics_path.exists():
+            exp_dir = legacy_exp_dir
+            metrics_path = legacy_metrics_path
+    if metrics_path.exists():
         # Already completed — load and return
         try:
-            metrics = json.loads((tdir / "metrics.json").read_text(encoding="utf-8"))
+            metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            metrics["_trial_idx"] = idx
+            metrics["_trial_dir"] = str(exp_dir)
+            for k, v in trial_cfg.items():
+                metrics[f"_param_{k}"] = v
             print(f"  [{idx}] SKIP (already done): {metrics.get('best_val_acc', '?')}")
             return metrics
         except Exception:
@@ -266,10 +367,6 @@ def run_trial(
         # The actual output dir path depends on how train_mlp constructs the name.
         # train_mlp uses `make_experiment_name` → "<base_name>_<model>_<ssl_method>"
         # Since we set --name, the experiment name becomes: tdir.name + "_mlp_" + ssl_method
-        exp_name = f"{tdir.name}_mlp_{ssl_method}"
-        exp_dir = tdir.parent / exp_name
-
-        metrics_path = exp_dir / "metrics.json"
         if metrics_path.exists():
             metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
             metrics["_trial_idx"] = idx
@@ -287,8 +384,7 @@ def run_trial(
             return None
 
     except subprocess.TimeoutExpired:
-        print(f"  [{idx}] TIMEOUT after {timeout}s")
-        proc.kill()
+        print(f"  [{idx}] TIMEOUT after {timeout}s (subprocess already killed)")
         return None
 
 
@@ -369,6 +465,7 @@ Examples:
         for key, default_val in DEFAULT_FIXED.items():
             if key not in cfg:
                 cfg[key] = default_val
+        cfg["seed"] = args.seed
 
     # ── Output directory ────────────────────────────────────────────
     output_dir = Path(args.output_dir) / args.ssl_method
@@ -392,6 +489,7 @@ Examples:
             output_dir=output_dir,
             ssl_method=args.ssl_method,
             data_dir=args.data_dir,
+            search_keys=set(param_space.keys()),
             timeout=args.timeout,
         )
         if metrics is None:

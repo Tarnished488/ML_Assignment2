@@ -627,7 +627,7 @@ def run_single_experiment(args, device):
     X_test = scaler.transform(X_test_raw)
     test_loader = make_loader(X_test, batch_size=args.batch_size)
     test_pred, test_confs, test_probs = predict(model, test_loader, device)
-    test_labels = classes[test_pred]
+    test_labels = test_pred  # 0..K-1 integer labels as required
 
     sub_path = out / "submission.csv"
     pd.DataFrame({"Id": test_ids, "Category": test_labels}).to_csv(sub_path, index=False)
@@ -683,17 +683,29 @@ def run_single_experiment(args, device):
 
 def planned_experiments(args):
     configs = []
-    model_variants = [
+    all_model_variants = [
         ("mlp", None),
         ("cnn", "32x16"),
         ("cnn", "8x64"),
     ]
+    # --models: comma-separated filter, e.g. "mlp" or "mlp,cnn"
+    if getattr(args, "models", None):
+        allowed = set(m.strip() for m in args.models.split(","))
+        model_variants = [(m, l) for m, l in all_model_variants if m in allowed]
+    else:
+        model_variants = all_model_variants
+
     ssl_variants = [
         (False, "supervised"),
         (True, "pseudo"),
         (True, "distill"),
         (True, "self_training"),
     ]
+
+    # When --models is used with --use-ssl, only run the specified method (+ supervised)
+    if getattr(args, "models", None) and args.use_ssl:
+        ssl_variants = [v for v in ssl_variants
+                        if v[1] == args.ssl_method or not v[0]]
 
     for model_type, cnn_layout in model_variants:
         for use_ssl, ssl_method in ssl_variants:
@@ -727,6 +739,9 @@ def main():
     parser.add_argument("--val-size", type=float, default=0.2)
 
     # Model
+    parser.add_argument("--models", default=None,
+                        help="Comma-separated model types to run, e.g. 'mlp' or 'mlp,cnn'. "
+                             "Default: all (mlp,cnn)")
     parser.add_argument("--model-type", choices=["mlp", "cnn"], default="mlp")
     parser.add_argument("--hidden-dims", default="256,128,64")
     parser.add_argument("--dropout", type=float, default=0.3)
