@@ -66,6 +66,7 @@ def train_distill(
     """
     T = args.distill_T
     alpha = args.distill_alpha
+    has_val = X_val is not None and y_val is not None
 
     labeled_dataset = TensorDataset(
         torch.tensor(X_labeled, dtype=torch.float32),
@@ -80,24 +81,17 @@ def train_distill(
     )
     unlabeled_loader = DataLoader(unlabeled_dataset, batch_size=args.batch_size * 2, shuffle=True)
 
-    # Separate VAT loader with all unlabeled data (no LP targets needed for VAT)
     vat_loader = None
     if args.use_vat:
         vat_dataset = TensorDataset(torch.tensor(X_unlabeled, dtype=torch.float32))
         vat_loader = DataLoader(vat_dataset, batch_size=args.batch_size * 4, shuffle=True)
 
-    val_loader = make_loader(X_val, y_val, args.batch_size)
+    val_loader = make_loader(X_val, y_val, args.batch_size) if has_val else None
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", factor=args.lr_factor, patience=args.lr_patience,
-    )
-    vat_criterion = CombinedSSLLoss(
-        vat_weight=args.vat_weight if args.use_vat else 0.0,
-        pi_weight=0.0,
-        vat_epsilon=args.vat_epsilon,
-        ramp_up_epochs=args.vat_rampup,
-    )
+    ) if has_val else None
 
     history = {"train_loss": [], "val_loss": [], "val_acc": [], "val_macro_f1": [], "lr": []}
     best_state, best_val_acc, best_val_f1, best_epoch = None, -1.0, -1.0, 0
@@ -105,7 +99,6 @@ def train_distill(
 
     for epoch in range(1, args.epochs + 1):
         model.train()
-        vat_criterion.set_epoch(epoch)
         total_loss, total_ce, total_kd, total_vat, total_count = 0.0, 0.0, 0.0, 0.0, 0
 
         unlabeled_iter = iter(unlabeled_loader)
@@ -121,11 +114,9 @@ def train_distill(
                 X_u, lp_u = next(unlabeled_iter)
             X_u, lp_u = X_u.to(device), lp_u.to(device)
 
-            # Supervised CE on labeled data
             logits_l = model(X_l)
             ce_loss = F.cross_entropy(logits_l, y_l)
 
-            # KD: KL(LP_soft || MLP_soft_T) * T²
             logits_u = model(X_u)
             log_probs_T = F.log_softmax(logits_u / T, dim=1)
             log_lp = torch.log(lp_u + 1e-12)
@@ -134,7 +125,6 @@ def train_distill(
                 * (T ** 2)
             )
 
-            # VAT on unlabeled data
             vat_loss_val = torch.tensor(0.0, device=device)
             if vat_iter is not None:
                 try:
@@ -161,49 +151,59 @@ def train_distill(
 
         train_loss = total_loss / total_count
 
-        # Validation
-        val_pred, _, _ = predict(model, val_loader, device)
-        val_metrics = compute_metrics(y_val, val_pred)
-        scheduler.step(val_metrics["accuracy"])
+        if has_val:
+            val_pred, _, _ = predict(model, val_loader, device)
+            val_metrics = compute_metrics(y_val, val_pred)
+            scheduler.step(val_metrics["accuracy"])
+
+            history["val_acc"].append(val_metrics["accuracy"])
+            history["val_macro_f1"].append(val_metrics["macro_f1"])
+
+            ce_fn = nn.CrossEntropyLoss()
+            val_ce = 0.0
+            model.eval()
+            with torch.no_grad():
+                for X_b, y_b in val_loader:
+                    val_ce += ce_fn(model(X_b.to(device)), y_b.to(device)).item() * X_b.size(0)
+            history["val_loss"].append(val_ce / len(y_val))
+
+            if val_metrics["accuracy"] > best_val_acc:
+                best_val_acc = val_metrics["accuracy"]
+                best_val_f1 = val_metrics["macro_f1"]
+                best_epoch = epoch
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+        else:
+            history["val_acc"].append(0.0)
+            history["val_macro_f1"].append(0.0)
+            history["val_loss"].append(0.0)
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_epoch = epoch
 
         history["train_loss"].append(train_loss)
-        history["val_acc"].append(val_metrics["accuracy"])
-        history["val_macro_f1"].append(val_metrics["macro_f1"])
         history["lr"].append(optimizer.param_groups[0]["lr"])
 
-        # Val CE loss (for plotting)
-        ce_fn = nn.CrossEntropyLoss()
-        val_ce = 0.0
-        model.eval()
-        with torch.no_grad():
-            for X_b, y_b in val_loader:
-                val_ce += ce_fn(model(X_b.to(device)), y_b.to(device)).item() * X_b.size(0)
-        history["val_loss"].append(val_ce / len(y_val))
-
-        if val_metrics["accuracy"] > best_val_acc:
-            best_val_acc = val_metrics["accuracy"]
-            best_val_f1 = val_metrics["macro_f1"]
-            best_epoch = epoch
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            epochs_no_improve = 0
-        else:
-            epochs_no_improve += 1
-
         if epoch == 1 or epoch % args.log_every == 0:
+            val_str = (
+                f"| val_acc={val_metrics['accuracy']:.4f} "
+                f"| val_f1={val_metrics['macro_f1']:.4f}"
+            ) if has_val else ""
             print(
                 f"  [distill] Epoch {epoch:03d} | loss={train_loss:.4f} "
                 f"(CE={total_ce/total_count:.4f} KD={total_kd/total_count:.4f} "
                 f"VAT={total_vat/total_count:.4f}) "
-                f"| val_acc={val_metrics['accuracy']:.4f} "
-                f"| val_f1={val_metrics['macro_f1']:.4f} "
+                f"{val_str} "
                 f"| lr={optimizer.param_groups[0]['lr']:.6f}"
             )
 
-        if epochs_no_improve >= args.patience:
+        if has_val and epochs_no_improve >= args.patience:
             print(f"  Early stopping at epoch {epoch}; best was {best_epoch}.")
             break
 
-    model.load_state_dict(best_state)
+    if best_state is not None:
+        model.load_state_dict(best_state)
     return model, history, best_epoch, best_val_acc, best_val_f1
 
 
@@ -217,6 +217,8 @@ def train_standard(
     stage_name="train", X_unlabeled=None,
 ):
     """Train with CE loss + optional VAT consistency."""
+    has_val = X_val is not None and y_val is not None
+
     criterion = CombinedSSLLoss(
         vat_weight=args.vat_weight if args.use_vat else 0.0,
         pi_weight=args.pi_weight if args.use_vat else 0.0,
@@ -227,16 +229,15 @@ def train_standard(
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", factor=args.lr_factor, patience=args.lr_patience,
-    )
+    ) if has_val else None
 
-    # Use drop_last=True to avoid BatchNorm1d error on last incomplete batch
     train_dataset = TensorDataset(
         torch.tensor(X_train, dtype=torch.float32),
         torch.tensor(y_train, dtype=torch.long),
     )
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
                               shuffle=True, drop_last=True)
-    val_loader = make_loader(X_val, y_val, args.batch_size, shuffle=False)
+    val_loader = make_loader(X_val, y_val, args.batch_size, shuffle=False) if has_val else None
     unlabeled_loader = None
     if X_unlabeled is not None and args.use_vat:
         unlabeled_loader = make_loader(X_unlabeled, batch_size=args.batch_size * 4, shuffle=True)
@@ -273,46 +274,57 @@ def train_standard(
             total_count += X_b.size(0)
 
         train_loss = total_loss / total_count
-
-        val_pred, _, _ = predict(model, val_loader, device)
-        val_metrics = compute_metrics(y_val, val_pred)
-        scheduler.step(val_metrics["accuracy"])
-
         history["train_loss"].append(train_loss)
-        history["val_acc"].append(val_metrics["accuracy"])
-        history["val_macro_f1"].append(val_metrics["macro_f1"])
         history["lr"].append(optimizer.param_groups[0]["lr"])
 
-        ce_fn = nn.CrossEntropyLoss()
-        val_ce = 0.0
-        model.eval()
-        with torch.no_grad():
-            for X_b, y_b in val_loader:
-                val_ce += ce_fn(model(X_b.to(device)), y_b.to(device)).item() * X_b.size(0)
-        history["val_loss"].append(val_ce / len(y_val))
+        if has_val:
+            val_pred, _, _ = predict(model, val_loader, device)
+            val_metrics = compute_metrics(y_val, val_pred)
+            scheduler.step(val_metrics["accuracy"])
 
-        if val_metrics["accuracy"] > best_val_acc:
-            best_val_acc = val_metrics["accuracy"]
-            best_val_f1 = val_metrics["macro_f1"]
-            best_epoch = epoch
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            epochs_no_improve = 0
+            history["val_acc"].append(val_metrics["accuracy"])
+            history["val_macro_f1"].append(val_metrics["macro_f1"])
+
+            ce_fn = nn.CrossEntropyLoss()
+            val_ce = 0.0
+            model.eval()
+            with torch.no_grad():
+                for X_b, y_b in val_loader:
+                    val_ce += ce_fn(model(X_b.to(device)), y_b.to(device)).item() * X_b.size(0)
+            history["val_loss"].append(val_ce / len(y_val))
+
+            if val_metrics["accuracy"] > best_val_acc:
+                best_val_acc = val_metrics["accuracy"]
+                best_val_f1 = val_metrics["macro_f1"]
+                best_epoch = epoch
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
         else:
-            epochs_no_improve += 1
+            history["val_acc"].append(0.0)
+            history["val_macro_f1"].append(0.0)
+            history["val_loss"].append(0.0)
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_epoch = epoch
 
         if epoch == 1 or epoch % args.log_every == 0:
+            val_str = (
+                f"| val_acc={val_metrics['accuracy']:.4f} "
+                f"| val_f1={val_metrics['macro_f1']:.4f}"
+            ) if has_val else ""
             print(
                 f"  [{stage_name}] Epoch {epoch:03d} | loss={train_loss:.4f} "
-                f"| val_acc={val_metrics['accuracy']:.4f} "
-                f"| val_f1={val_metrics['macro_f1']:.4f} "
+                f"{val_str} "
                 f"| lr={optimizer.param_groups[0]['lr']:.6f}"
             )
 
-        if epochs_no_improve >= args.patience:
+        if has_val and epochs_no_improve >= args.patience:
             print(f"  Early stopping at epoch {epoch}; best was {best_epoch}.")
             break
 
-    model.load_state_dict(best_state)
+    if best_state is not None:
+        model.load_state_dict(best_state)
     return model, history, best_epoch, best_val_acc, best_val_f1
 
 
@@ -524,15 +536,28 @@ def run_single_experiment(args, device):
     # ------------------------------------------------------------------
     # 1. Load data
     # ------------------------------------------------------------------
-    X_train_raw, X_val_raw, y_train_raw, y_val_raw, scaler = get_train_val_split(
-        val_size=args.val_size, random_state=args.seed, data_dir=args.data_dir,
-    )
+    if getattr(args, "use_all_labeled", False):
+        from src.preprocessing.data_loader import load_labeled_data
+        from sklearn.preprocessing import StandardScaler
+        X_all_labeled, y_all_labeled = load_labeled_data(args.data_dir)
+        scaler = StandardScaler()
+        X_train_raw = scaler.fit_transform(X_all_labeled)
+        y_train_raw = y_all_labeled
+        X_val_raw, y_val_raw = None, None
+        y_val = None
+    else:
+        X_train_raw, X_val_raw, y_train_raw, y_val_raw, scaler = get_train_val_split(
+            val_size=args.val_size, random_state=args.seed, data_dir=args.data_dir,
+        )
+
     y_train, classes, class_to_idx = encode_labels(y_train_raw)
-    y_val = np.array([class_to_idx[c] for c in y_val_raw], dtype=np.int64)
+    if y_val_raw is not None:
+        y_val = np.array([class_to_idx[c] for c in y_val_raw], dtype=np.int64)
     num_classes = len(classes)
     X_unlabeled = scaler.transform(load_unlabeled_data(args.data_dir))
 
-    print(f"Labeled: {len(y_train)} train / {len(y_val)} val | "
+    print(f"Labeled: {len(y_train)} train / "
+          f"{'no val (all labeled)' if y_val is None else f'{len(y_val)} val'} | "
           f"Unlabeled: {len(X_unlabeled)} | Classes: {num_classes}")
 
     # ------------------------------------------------------------------
@@ -615,7 +640,10 @@ def run_single_experiment(args, device):
         )
 
     print(f"\n{'='*50}")
-    print(f"Best val_acc={best_val_acc:.4f}  macro_f1={best_val_f1:.4f}  (epoch {best_epoch})")
+    if y_val is not None:
+        print(f"Best val_acc={best_val_acc:.4f}  macro_f1={best_val_f1:.4f}  (epoch {best_epoch})")
+    else:
+        print(f"Trained {best_epoch} epochs (no val — all labeled data used)")
 
     # ------------------------------------------------------------------
     # 4. Generate submission
@@ -640,9 +668,15 @@ def run_single_experiment(args, device):
     # Save model
     torch.save(model.state_dict(), out / "model.pt")
 
-    val_loader = make_loader(X_val_raw, y_val, args.batch_size, shuffle=False)
-    val_pred, _, _ = predict(model, val_loader, device)
-    final_val_metrics = compute_metrics(y_val, val_pred)
+    if y_val is not None and X_val_raw is not None:
+        val_loader = make_loader(X_val_raw, y_val, args.batch_size, shuffle=False)
+        val_pred, _, _ = predict(model, val_loader, device)
+        final_val_metrics = compute_metrics(y_val, val_pred)
+    else:
+        final_val_metrics = {
+            "accuracy": None, "macro_f1": None, "weighted_f1": None,
+            "macro_precision": None, "macro_recall": None,
+        }
 
     metrics = {
         "name": args.name,
@@ -651,8 +685,8 @@ def run_single_experiment(args, device):
         "ssl_enabled": bool(args.use_ssl),
         "ssl_method": args.ssl_method if args.use_ssl else "supervised",
         "best_epoch": int(best_epoch),
-        "best_val_acc": float(best_val_acc),
-        "best_val_macro_f1": float(best_val_f1),
+        "best_val_acc": float(best_val_acc) if y_val is not None else None,
+        "best_val_macro_f1": float(best_val_f1) if y_val is not None else None,
         "final_val_metrics": final_val_metrics,
         "train_size_final": int(len(y_train_ssl)),
         "pseudo_labels_added": int(len(y_train_ssl) - len(y_train)),
@@ -669,9 +703,9 @@ def run_single_experiment(args, device):
     print(f"Prediction distribution: {dict(zip(unique, counts))}")
 
     # ------------------------------------------------------------------
-    # 5. Visualizations
+    # 5. Visualizations (skip when no val data)
     # ------------------------------------------------------------------
-    if not args.no_viz:
+    if not args.no_viz and y_val is not None and X_val_raw is not None:
         generate_visualizations(
             model, history, X_train_ssl, y_train_ssl,
             X_val_raw, y_val, X_unlabeled, classes, device, args,
@@ -737,6 +771,8 @@ def main():
         default=_resolve_data_dir(),
     )
     parser.add_argument("--val-size", type=float, default=0.2)
+    parser.add_argument("--use-all-labeled", action="store_true",
+                        help="Use all 100 labeled samples for training (no val split)")
 
     # Model
     parser.add_argument("--models", default=None,
