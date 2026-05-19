@@ -49,7 +49,7 @@ from src.preprocessing.data_loader import _resolve_data_dir
 PRESETS: dict[str, dict[str, Any]] = {
     # ── Model architecture ──────────────────────────────────────────
     "model": {
-        "hidden_dims": ["128,64,32", "256,128,64", "512,256,128", "512,256,128,64"],
+        "hidden_dims": ["128", "128,64", "128,64,32", "256,128,64"],
         "dropout": [0.2, 0.3, 0.4, 0.5, 0.6],
         "activation": ["relu", "gelu", "silu"],
         "norm": ["batch", "layer"],
@@ -118,7 +118,7 @@ PRESETS: dict[str, dict[str, Any]] = {
 
 # Default fixed values used when a parameter is NOT in the search space
 DEFAULT_FIXED = {
-    "hidden_dims": "256,128,64",
+    "hidden_dims": "128,64",
     "dropout": 0.3,
     "activation": "gelu",
     "norm": "batch",
@@ -216,6 +216,9 @@ def build_command(trial_cfg: dict[str, Any], ssl_method: str, data_dir: str) -> 
     # VAT is enabled implicitly for distill; explicitly for others via --use-vat
     if ssl_method == "distill":
         cmd.append("--use-vat")
+
+    if trial_cfg.get("pretrain_first"):
+        cmd.append("--pretrain-first")
 
     return cmd
 
@@ -431,6 +434,8 @@ Examples:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--timeout", type=int, default=1800,
                         help="Max seconds per trial")
+    parser.add_argument("--pretrain-first", action="store_true",
+                        help="Use labeled pretraining before self-training trials.")
 
     args = parser.parse_args()
 
@@ -466,6 +471,7 @@ Examples:
             if key not in cfg:
                 cfg[key] = default_val
         cfg["seed"] = args.seed
+        cfg["pretrain_first"] = args.pretrain_first
 
     # ── Output directory ────────────────────────────────────────────
     output_dir = Path(args.output_dir) / args.ssl_method

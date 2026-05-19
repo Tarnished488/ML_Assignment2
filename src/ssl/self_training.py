@@ -34,6 +34,34 @@ class SelfTrainingSSL:
         self.max_rounds = max_rounds
         self.batch_size = batch_size
 
+    def _select_model_pseudo_labels(
+        self,
+        preds: np.ndarray,
+        confs: np.ndarray,
+        num_classes: int,
+        threshold: float | None = None,
+        top_k_per_class: int | None = None,
+    ) -> np.ndarray:
+        """Select model pseudo-labels with confidence filtering + class balancing."""
+        threshold = self.mlp_relabel_threshold if threshold is None else threshold
+        keep = np.zeros(len(preds), dtype=bool)
+
+        for cls in range(num_classes):
+            cls_idx = np.where(preds == cls)[0]
+            if len(cls_idx) == 0:
+                continue
+
+            cls_idx = cls_idx[confs[cls_idx] >= threshold]
+            if len(cls_idx) == 0:
+                continue
+
+            if top_k_per_class is not None and len(cls_idx) > top_k_per_class:
+                order = np.argsort(-confs[cls_idx])[:top_k_per_class]
+                cls_idx = cls_idx[order]
+            keep[cls_idx] = True
+
+        return keep
+
     @torch.no_grad()
     def _mlp_pseudo_label(
         self,
@@ -87,6 +115,58 @@ class SelfTrainingSSL:
         }
         return X_aug, y_aug, X_remaining, record
 
+    def bootstrap_with_model(
+        self,
+        model: nn.Module,
+        X_labeled: np.ndarray,
+        y_labeled: np.ndarray,
+        X_unlabeled: np.ndarray,
+        device: torch.device,
+        num_classes: int,
+        threshold: float | None = None,
+        top_k_per_class: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+        """Build the initial augmented set directly from a pretrained model."""
+        if len(X_unlabeled) == 0:
+            record = {
+                "round": 1,
+                "method": "pretrained_model",
+                "added": 0,
+                "remaining_unlabeled": 0,
+                "threshold": float(
+                    self.mlp_relabel_threshold if threshold is None else threshold
+                ),
+            }
+            return X_labeled, y_labeled, X_unlabeled, record
+
+        preds, confs = self._mlp_pseudo_label(model, X_unlabeled, device)
+        keep = self._select_model_pseudo_labels(
+            preds=preds,
+            confs=confs,
+            num_classes=num_classes,
+            threshold=threshold,
+            top_k_per_class=top_k_per_class,
+        )
+
+        if keep.any():
+            X_aug = np.vstack([X_labeled, X_unlabeled[keep]])
+            y_aug = np.concatenate([y_labeled, preds[keep]])
+            X_remaining = X_unlabeled[~keep]
+        else:
+            X_aug = X_labeled
+            y_aug = y_labeled
+            X_remaining = X_unlabeled
+
+        threshold_used = self.mlp_relabel_threshold if threshold is None else threshold
+        record = {
+            "round": 1,
+            "method": "pretrained_model",
+            "added": int(keep.sum()),
+            "remaining_unlabeled": int(len(X_remaining)),
+            "threshold": float(threshold_used),
+        }
+        return X_aug, y_aug, X_remaining, record
+
     def relabel_with_model(
         self,
         model: nn.Module,
@@ -107,7 +187,13 @@ class SelfTrainingSSL:
             return X_labeled, y_labeled, X_unlabeled, record
 
         preds, confs = self._mlp_pseudo_label(model, X_unlabeled, device)
-        keep = confs >= self.mlp_relabel_threshold
+        keep = self._select_model_pseudo_labels(
+            preds=preds,
+            confs=confs,
+            num_classes=len(np.unique(y_labeled)),
+            threshold=self.mlp_relabel_threshold,
+            top_k_per_class=None,
+        )
 
         if keep.any():
             X_aug = np.vstack([X_labeled, X_unlabeled[keep]])

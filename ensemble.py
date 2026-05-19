@@ -1,5 +1,6 @@
 """Ensemble multiple model predictions with multiple strategies."""
 import argparse
+import json
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -46,6 +47,23 @@ def median_voting(probs_list):
     median_probs = np.median(stacked_probs, axis=1)
     return median_probs.argmax(axis=1)
 
+
+def load_run_artifacts(run_dir):
+    run_path = Path(run_dir)
+    probs_path = run_path / "test_probs.npy"
+    ids_path = run_path / "test_ids.npy"
+    metrics_path = run_path / "metrics.json"
+
+    if not probs_path.exists() or not ids_path.exists():
+        raise FileNotFoundError(f"Missing test_probs.npy/test_ids.npy under {run_path}")
+
+    probs = np.load(probs_path)
+    ids = np.load(ids_path)
+    metrics = {}
+    if metrics_path.exists():
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    return probs, ids, metrics
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--runs", nargs="+", required=True,
@@ -55,47 +73,68 @@ def main():
                         help="Ensemble method (default: soft)")
     parser.add_argument("--weights", nargs="+", type=float, default=None,
                         help="Per-model weights (default: equal)")
+    parser.add_argument("--auto-weights", default="none",
+                        choices=["none", "best_val_acc", "best_val_macro_f1"],
+                        help="Derive weights from each run's metrics.json.")
     args = parser.parse_args()
 
     all_probs = []
     all_ids = None
+    derived_weights = []
     for run_dir in args.runs:
-        probs_path = Path(run_dir) / "test_probs.npy"
-        ids_path = Path(run_dir) / "test_ids.npy"
-        if not probs_path.exists():
-            print(f"WARNING: {probs_path} not found, skipping.")
+        try:
+            probs, ids, metrics = load_run_artifacts(run_dir)
+        except FileNotFoundError as exc:
+            print(f"WARNING: {exc}, skipping.")
             continue
-        probs = np.load(probs_path)
-        ids = np.load(ids_path)
+
         all_probs.append(probs)
         if all_ids is None:
             all_ids = ids
+        elif not np.array_equal(all_ids, ids):
+            raise ValueError(f"Test Id mismatch detected in {run_dir}")
+
+        if args.auto_weights == "none":
+            derived_weights.append(1.0)
+        else:
+            metric_val = metrics.get(args.auto_weights)
+            if metric_val is None:
+                metric_val = 1.0
+            derived_weights.append(max(float(metric_val), 1e-6))
+
         # Print per-model distribution
         preds = probs.argmax(axis=1)
         unique, counts = np.unique(preds, return_counts=True)
-        print(f"{run_dir}: {dict(zip(unique, counts))}")
+        metric_str = ""
+        if args.auto_weights != "none":
+            metric_str = f" | weight_source={args.auto_weights}:{derived_weights[-1]:.4f}"
+        print(f"{run_dir}: {dict(zip(unique, counts))}{metric_str}")
 
     if not all_probs:
         print("No valid runs found.")
         return
 
+    weights = args.weights if args.weights is not None else derived_weights
+
     # Choose ensemble method
     if args.method == "soft":
-        final_preds = soft_voting(all_probs, args.weights)
+        final_preds = soft_voting(all_probs, weights)
     elif args.method == "hard":
         final_preds = hard_voting(all_probs)
     elif args.method == "weighted":
-        final_preds = weighted_soft_voting(all_probs)
+        final_preds = soft_voting(all_probs, weights)
     elif args.method == "rank":
         final_preds = rank_averaging(all_probs)
     elif args.method == "median":
         final_preds = median_voting(all_probs)
     else:
-        final_preds = soft_voting(all_probs, args.weights)
+        final_preds = soft_voting(all_probs, weights)
 
     # final_preds are already 0..K-1 integers from argmax
     unique, counts = np.unique(final_preds, return_counts=True)
     print(f"\nEnsemble ({args.method}): {dict(zip(unique, counts))}")
+    if weights is not None:
+        print(f"Weights: {[round(float(w), 4) for w in weights]}")
 
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)

@@ -43,7 +43,7 @@ class MLPClassifier(nn.Module):
         self,
         input_dim=512,
         num_classes=10,
-        hidden_dims=(256, 128, 64),
+        hidden_dims=(128, 64),
         dropout=0.3,
         activation="gelu",
         use_residual=True,
@@ -87,7 +87,7 @@ class MLPClassifier(nn.Module):
 def build_mlp(
     input_dim=512,
     num_classes=10,
-    hidden_dims=(256, 128, 64),
+    hidden_dims=(128, 64),
     dropout=0.3,
     activation="gelu",
     use_residual=True,

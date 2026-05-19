@@ -428,6 +428,34 @@ def build_model(input_dim, num_classes, args, device):
     return model
 
 
+def calibrate_self_training_threshold(model, X_val, y_val, device, args):
+    """Estimate a safer pseudo-label threshold from pretrained validation confidence."""
+    if X_val is None or y_val is None or len(y_val) == 0:
+        return args.self_train_threshold, {
+            "source": "default_no_val",
+            "threshold": float(args.self_train_threshold),
+        }
+
+    val_loader = make_loader(X_val, y_val, args.batch_size, shuffle=False)
+    val_pred, val_confs, _ = predict(model, val_loader, device)
+    correct_mask = val_pred == y_val
+    usable = val_confs[correct_mask] if correct_mask.any() else val_confs
+    quantile = float(np.quantile(usable, args.pretrain_threshold_quantile))
+    threshold = float(np.clip(
+        quantile,
+        args.pretrain_threshold_min,
+        args.pretrain_threshold_max,
+    ))
+    return threshold, {
+        "source": "correct_val_confidence" if correct_mask.any() else "all_val_confidence",
+        "threshold": threshold,
+        "quantile": float(args.pretrain_threshold_quantile),
+        "correct_samples": int(correct_mask.sum()),
+        "val_accuracy": float((val_pred == y_val).mean()),
+        "mean_confidence": float(val_confs.mean()),
+    }
+
+
 def train_self_training(
     X_train_raw,
     y_train,
@@ -475,6 +503,143 @@ def train_self_training(
     for round_idx in range(1, args.self_train_rounds + 1):
         model = build_model(X_current.shape[1], num_classes, args, device)
         stage_name = f"self_train_r{round_idx}"
+        unlabeled_for_vat = X_remaining if args.use_vat and len(X_remaining) > 0 else None
+        model, history, best_epoch, best_val_acc, best_val_f1 = train_standard(
+            model,
+            X_current,
+            y_current,
+            X_val_raw,
+            y_val,
+            device,
+            args,
+            stage_name=stage_name,
+            X_unlabeled=unlabeled_for_vat,
+        )
+        print(
+            f"  [SelfTraining] Round {round_idx} val_acc={best_val_acc:.4f} "
+            f"macro_f1={best_val_f1:.4f}"
+        )
+        round_summaries[-1]["train_size"] = int(len(y_current))
+        round_summaries[-1]["best_epoch"] = int(best_epoch)
+        round_summaries[-1]["best_val_acc"] = float(best_val_acc)
+        round_summaries[-1]["best_val_macro_f1"] = float(best_val_f1)
+
+        if round_idx >= args.self_train_rounds or len(X_remaining) == 0:
+            break
+
+        X_current, y_current, X_remaining, record = ssl.relabel_with_model(
+            model=model,
+            X_labeled=X_current,
+            y_labeled=y_current,
+            X_unlabeled=X_remaining,
+            device=device,
+            round_idx=round_idx + 1,
+        )
+        round_summaries.append(record)
+        print(
+            f"  [SelfTraining] Round {round_idx + 1}/{args.self_train_rounds}: "
+            f"+{record['added']} pseudo-labeled, "
+            f"remaining_unlabeled={record['remaining_unlabeled']}"
+        )
+        if record["added"] == 0:
+            break
+
+    return model, history, best_epoch, best_val_acc, best_val_f1, X_current, y_current, round_summaries
+
+
+def train_pretrain_guided_self_training(
+    X_train_raw,
+    y_train,
+    X_val_raw,
+    y_val,
+    X_unlabeled,
+    num_classes,
+    device,
+    args,
+):
+    """Pretrain on labeled data first, then warm-start self-training rounds."""
+    ssl = SelfTrainingSSL(
+        lp_kwargs=dict(
+            n_neighbors=args.lp_k,
+            alpha=args.lp_alpha,
+            class_balanced=True,
+            top_k_per_class=args.lp_top_k,
+            confidence_threshold=args.lp_conf,
+        ),
+        mlp_relabel_threshold=args.self_train_threshold,
+        max_rounds=args.self_train_rounds,
+        batch_size=args.batch_size,
+    )
+
+    model = build_model(X_train_raw.shape[1], num_classes, args, device)
+    pretrain_args = SimpleNamespace(**vars(args))
+    pretrain_args.epochs = args.pretrain_epochs
+    pretrain_args.patience = args.pretrain_patience
+    if args.pretrain_lr is not None:
+        pretrain_args.lr = args.pretrain_lr
+
+    print(
+        "Training: Pretrain -> Self-Training | "
+        f"pretrain_epochs={pretrain_args.epochs} | rounds={args.self_train_rounds}"
+    )
+    model, _, pretrain_epoch, pretrain_val_acc, pretrain_val_f1 = train_standard(
+        model,
+        X_train_raw,
+        y_train,
+        X_val_raw,
+        y_val,
+        device,
+        pretrain_args,
+        stage_name="pretrain",
+        X_unlabeled=None,
+    )
+
+    threshold, calibration = calibrate_self_training_threshold(
+        model=model,
+        X_val=X_val_raw,
+        y_val=y_val,
+        device=device,
+        args=args,
+    )
+    ssl.mlp_relabel_threshold = threshold
+    print(
+        f"  [Pretrain] best_val_acc={pretrain_val_acc:.4f} "
+        f"macro_f1={pretrain_val_f1:.4f} | calibrated_threshold={threshold:.4f}"
+    )
+
+    round_summaries = [{
+        "round": 0,
+        "method": "pretrain",
+        "best_epoch": int(pretrain_epoch),
+        "best_val_acc": float(pretrain_val_acc),
+        "best_val_macro_f1": float(pretrain_val_f1),
+        "calibration": calibration,
+    }]
+
+    X_current, y_current, X_remaining, first_round = ssl.bootstrap_with_model(
+        model=model,
+        X_labeled=X_train_raw,
+        y_labeled=y_train,
+        X_unlabeled=X_unlabeled,
+        device=device,
+        num_classes=num_classes,
+        threshold=threshold,
+        top_k_per_class=args.pretrain_top_k,
+    )
+    round_summaries.append(first_round)
+    print(
+        f"  [SelfTraining] Warm start round 1/{args.self_train_rounds}: "
+        f"+{first_round['added']} pseudo-labeled, "
+        f"remaining_unlabeled={first_round['remaining_unlabeled']}"
+    )
+
+    history = None
+    best_epoch = pretrain_epoch
+    best_val_acc = pretrain_val_acc
+    best_val_f1 = pretrain_val_f1
+
+    for round_idx in range(1, args.self_train_rounds + 1):
+        stage_name = f"finetune_r{round_idx}"
         unlabeled_for_vat = X_remaining if args.use_vat and len(X_remaining) > 0 else None
         model, history, best_epoch, best_val_acc, best_val_f1 = train_standard(
             model,
@@ -609,20 +774,32 @@ def run_single_experiment(args, device):
     # 3. Build model and train
     # ------------------------------------------------------------------
     if args.use_ssl and args.ssl_method == "self_training":
-        print(
-            "Training: Self-Training | "
-            f"rounds={args.self_train_rounds} | threshold={args.self_train_threshold}"
-        )
-        model, history, best_epoch, best_val_acc, best_val_f1, X_train_ssl, y_train_ssl, self_training_rounds = train_self_training(
-            X_train_raw,
-            y_train,
-            X_val_raw,
-            y_val,
-            X_unlabeled,
-            num_classes,
-            device,
-            args,
-        )
+        if args.pretrain_first:
+            model, history, best_epoch, best_val_acc, best_val_f1, X_train_ssl, y_train_ssl, self_training_rounds = train_pretrain_guided_self_training(
+                X_train_raw,
+                y_train,
+                X_val_raw,
+                y_val,
+                X_unlabeled,
+                num_classes,
+                device,
+                args,
+            )
+        else:
+            print(
+                "Training: Self-Training | "
+                f"rounds={args.self_train_rounds} | threshold={args.self_train_threshold}"
+            )
+            model, history, best_epoch, best_val_acc, best_val_f1, X_train_ssl, y_train_ssl, self_training_rounds = train_self_training(
+                X_train_raw,
+                y_train,
+                X_val_raw,
+                y_val,
+                X_unlabeled,
+                num_classes,
+                device,
+                args,
+            )
     else:
         model = build_model(X_train_ssl.shape[1], num_classes, args, device)
 
@@ -684,6 +861,7 @@ def run_single_experiment(args, device):
         "cnn_layout": args.cnn_layout if args.model_type == "cnn" else None,
         "ssl_enabled": bool(args.use_ssl),
         "ssl_method": args.ssl_method if args.use_ssl else "supervised",
+        "pretrain_first": bool(getattr(args, "pretrain_first", False)),
         "best_epoch": int(best_epoch),
         "best_val_acc": float(best_val_acc) if y_val is not None else None,
         "best_val_macro_f1": float(best_val_f1) if y_val is not None else None,
@@ -736,10 +914,11 @@ def planned_experiments(args):
         (True, "self_training"),
     ]
 
-    # When --models is used with --use-ssl, only run the specified method (+ supervised)
+    # When --models is used with --use-ssl, only run the specified method (+ supervised baseline)
     if getattr(args, "models", None) and args.use_ssl:
+        keep_baseline = not getattr(args, "no_baseline", False)
         ssl_variants = [v for v in ssl_variants
-                        if v[1] == args.ssl_method or not v[0]]
+                        if v[1] == args.ssl_method or (not v[0] and keep_baseline)]
 
     for model_type, cnn_layout in model_variants:
         for use_ssl, ssl_method in ssl_variants:
@@ -779,7 +958,7 @@ def main():
                         help="Comma-separated model types to run, e.g. 'mlp' or 'mlp,cnn'. "
                              "Default: all (mlp,cnn)")
     parser.add_argument("--model-type", choices=["mlp", "cnn"], default="mlp")
-    parser.add_argument("--hidden-dims", default="256,128,64")
+    parser.add_argument("--hidden-dims", default="128,64")
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--activation", choices=["relu", "gelu", "silu"], default="gelu")
     parser.add_argument("--norm", choices=["batch", "layer"], default="batch")
@@ -807,6 +986,16 @@ def main():
     parser.add_argument("--lp-conf", type=float, default=0.6)
     parser.add_argument("--self-train-rounds", type=int, default=3)
     parser.add_argument("--self-train-threshold", type=float, default=0.85)
+    parser.add_argument("--pretrain-first", action="store_true",
+                        help="For self-training: pretrain on labeled data, then warm-start pseudo-label retraining.")
+    parser.add_argument("--pretrain-epochs", type=int, default=120)
+    parser.add_argument("--pretrain-patience", type=int, default=25)
+    parser.add_argument("--pretrain-lr", type=float, default=None)
+    parser.add_argument("--pretrain-threshold-quantile", type=float, default=0.75)
+    parser.add_argument("--pretrain-threshold-min", type=float, default=0.70)
+    parser.add_argument("--pretrain-threshold-max", type=float, default=0.95)
+    parser.add_argument("--pretrain-top-k", type=int, default=128,
+                        help="Per-class cap for pseudo-labels selected from the pretrained model.")
 
     # Distillation
     parser.add_argument("--distill-T", type=float, default=2.0,
@@ -825,6 +1014,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--no-viz", action="store_true")
+    parser.add_argument("--no-baseline", action="store_true",
+                        help="Skip supervised baseline (used for tuning)")
 
     args = parser.parse_args()
     args.base_name = args.name
