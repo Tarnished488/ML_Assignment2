@@ -1462,7 +1462,6 @@ def main():
 
     # Experiment
     parser.add_argument("--name", default="all_models")
-    parser.add_argument("--group", default="Group_XX")
     parser.add_argument("--output-dir", default="outputs")
 
     # Data

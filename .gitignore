@@ -3,4 +3,3 @@ __pycache__/
 data/
 outputs/
 .DS_Store
-.grid_search_tune.py

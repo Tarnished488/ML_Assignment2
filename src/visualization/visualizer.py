@@ -416,32 +416,3 @@ def plot_training_curves(
 # ===================================================================
 
 
-def plot_comparison_bars(
-    results: list[dict],
-    metric: str = "val_acc",
-    title: str = "Model Comparison",
-    save_path: Optional[str] = None,
-) -> plt.Figure:
-    """Horizontal bar chart comparing a metric across experiments.
-
-    Parameters
-    ----------
-    results : list of dict
-        Each dict must have keys ``name`` and the requested ``metric``.
-    metric : str
-        Metric key to compare.
-    title : str
-    save_path : str or None
-    """
-    names = [r["name"] for r in results]
-    values = [r[metric] for r in results]
-
-    fig, ax = plt.subplots(figsize=(8, 0.5 * len(names) + 1.5))
-    bars = ax.barh(names, values, color=plt.cm.Blues(np.linspace(0.4, 0.9, len(names))))
-    ax.bar_label(bars, fmt="%.4f", fontsize=FONTSIZE_TICK)
-    _style_ax(ax, metric, "", title)
-    fig.tight_layout()
-    _ensure_path(save_path)
-    if save_path:
-        fig.savefig(save_path, dpi=DPI)
-    return fig
