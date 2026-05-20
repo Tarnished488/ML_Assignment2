@@ -63,6 +63,14 @@ def base_train_command(args, seed: int, name: str) -> list[str]:
         "--pretrain-threshold-min", str(args.pretrain_threshold_min),
         "--pretrain-threshold-max", str(args.pretrain_threshold_max),
         "--pretrain-top-k", str(args.pretrain_top_k),
+        "--st-dynamic-threshold", "true" if args.st_dynamic_threshold else "false",
+        "--st-initial-threshold", str(args.st_initial_threshold),
+        "--st-threshold-decay", str(args.st_threshold_decay),
+        "--st-min-threshold", str(args.st_min_threshold),
+        "--st-top-k-per-round", str(args.st_top_k_per_round),
+        "--st-per-class-adjustment", str(args.st_per_class_adjustment),
+        "--cluster-seed-mode", str(args.cluster_seed_mode),
+        "--cluster-max-seeds", str(args.cluster_max_seeds),
         "--seed", str(seed),
         "--no-viz",
     ]
@@ -79,12 +87,14 @@ def build_train_command(args, seed: int) -> list[str]:
         "--no-baseline",
     ])
 
-    if args.ssl_method in {"self_training", "clustering", "cluster_propagation"} and not args.no_pretrain_first:
+    if args.ssl_method in {"self_training", "clustering", "cluster_propagation", "constrained_clustering"} and not args.no_pretrain_first:
         cmd.append("--pretrain-first")
     if not args.cluster_require_agreement:
         cmd.append("--cluster-no-agreement")
     if args.use_vat:
         cmd.append("--use-vat")
+    if args.vat_weight is not None:
+        cmd.extend(["--vat-weight", str(args.vat_weight)])
     if args.pretrain_lr is not None:
         cmd.extend(["--pretrain-lr", str(args.pretrain_lr)])
     return cmd
@@ -131,11 +141,13 @@ def main():
     parser.add_argument("--output-dir", default="outputs")
     parser.add_argument("--data-dir", default=_resolve_data_dir())
     parser.add_argument("--seeds", nargs="+", type=int, default=DEFAULT_SEEDS)
-    parser.add_argument("--ssl-method", choices=["pseudo", "distill", "self_training", "clustering", "cluster_propagation"],
+    parser.add_argument("--ssl-method", choices=["pseudo", "distill", "self_training", "clustering", "cluster_propagation", "constrained_clustering"],
                         default="cluster_propagation")
     parser.add_argument("--ensemble-output", default="outputs/ensemble/submission.csv")
     parser.add_argument("--include-supervised", action="store_true",
                         help="Also train one supervised full-label model per seed and include it in the ensemble.")
+    parser.add_argument("--only-supervised", action="store_true",
+                        help="Only train supervised models (no SSL) and ensemble them.")
     parser.add_argument("--ensemble-method", choices=["soft", "hard"], default="soft",
                         help="Ensemble voting method (default: soft)")
     parser.add_argument("--hidden-dims", default="128,64")
@@ -172,7 +184,17 @@ def main():
     parser.add_argument("--pretrain-threshold-min", type=float, default=0.70)
     parser.add_argument("--pretrain-threshold-max", type=float, default=0.95)
     parser.add_argument("--pretrain-top-k", type=int, default=128)
+    parser.add_argument("--st-dynamic-threshold", type=lambda x: x.lower() in ("true", "1", "yes"),
+                        default=True)
+    parser.add_argument("--st-initial-threshold", type=float, default=0.95)
+    parser.add_argument("--st-threshold-decay", type=float, default=0.85)
+    parser.add_argument("--st-min-threshold", type=float, default=0.70)
+    parser.add_argument("--st-top-k-per-round", type=int, default=500)
+    parser.add_argument("--st-per-class-adjustment", type=float, default=0.15)
+    parser.add_argument("--cluster-seed-mode", choices=["centroid", "multi"], default="centroid")
+    parser.add_argument("--cluster-max-seeds", type=int, default=5)
     parser.add_argument("--use-vat", action="store_true")
+    parser.add_argument("--vat-weight", type=float, default=None)
     parser.add_argument("--use-all-labeled", action="store_true")
     args = parser.parse_args()
 
@@ -182,7 +204,7 @@ def main():
     weights = []
 
     for seed in args.seeds:
-        if args.include_supervised:
+        if args.include_supervised or args.only_supervised:
             sup_cmd = build_supervised_command(args, seed)
             print(f"\n[{seed}] Running supervised {' '.join(sup_cmd)}")
             proc = subprocess.run(sup_cmd, cwd=Path(__file__).resolve().parent)
@@ -203,6 +225,9 @@ def main():
                 ids_ref = sup_ids
             elif not np.array_equal(ids_ref, sup_ids):
                 raise ValueError(f"Test Id mismatch detected for supervised seed {seed}")
+
+        if args.only_supervised:
+            continue
 
         cmd = build_train_command(args, seed)
         print(f"\n[{seed}] Running ssl {' '.join(cmd)}")

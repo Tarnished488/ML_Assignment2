@@ -116,6 +116,17 @@ PRESETS: dict[str, dict[str, Any]] = {
         "lp_top_k": [200, 300, 400, 500],
     },
 
+    # ── ST dynamic threshold tuning ────────────────────────────────
+    "st_dynamic": {
+        "st_initial_threshold": [0.90, 0.95, 0.98],
+        "st_threshold_decay": [0.75, 0.80, 0.85, 0.90],
+        "st_min_threshold": [0.60, 0.65, 0.70, 0.75],
+        "st_top_k_per_round": [300, 400, 500, 600, 800],
+        "st_per_class_adjustment": [0.05, 0.10, 0.15, 0.20],
+        "self_train_rounds": [3, 4, 5],
+        "self_train_threshold": [0.80, 0.85, 0.90],
+    },
+
     # ── Combined — top-12 most impactful params (for random search) ──
     "combined": {
         "lr": [1e-4, 3e-4, 5e-4, 1e-3, 3e-3],
@@ -159,6 +170,13 @@ DEFAULT_FIXED = {
     "cluster_max_iter": 80,
     "cluster_n_init": 3,
     "cluster_model_conf": 0.7,
+    "st_initial_threshold": 0.95,
+    "st_threshold_decay": 0.85,
+    "st_min_threshold": 0.70,
+    "st_top_k_per_round": 500,
+    "st_per_class_adjustment": 0.15,
+    "cluster_seed_mode": "centroid",
+    "cluster_max_seeds": 5,
     "epochs": 300,
     "patience": 50,
     "lr_factor": 0.5,
@@ -232,6 +250,13 @@ def build_command(trial_cfg: dict[str, Any], ssl_method: str, data_dir: str) -> 
         "cluster_max_iter": "--cluster-max-iter",
         "cluster_n_init": "--cluster-n-init",
         "cluster_model_conf": "--cluster-model-conf",
+        "st_initial_threshold": "--st-initial-threshold",
+        "st_threshold_decay": "--st-threshold-decay",
+        "st_min_threshold": "--st-min-threshold",
+        "st_top_k_per_round": "--st-top-k-per-round",
+        "st_per_class_adjustment": "--st-per-class-adjustment",
+        "cluster_seed_mode": "--cluster-seed-mode",
+        "cluster_max_seeds": "--cluster-max-seeds",
         "epochs": "--epochs",
         "patience": "--patience",
         "lr_factor": "--lr-factor",
@@ -292,6 +317,13 @@ def compact_trial_name(
         "cluster_max_iter": "cmi",
         "cluster_n_init": "cni",
         "cluster_model_conf": "cmc",
+        "st_initial_threshold": "sit",
+        "st_threshold_decay": "std",
+        "st_min_threshold": "smt",
+        "st_top_k_per_round": "stk",
+        "st_per_class_adjustment": "spa",
+        "cluster_seed_mode": "csm",
+        "cluster_max_seeds": "cms",
         "vat_epsilon": "ve",
         "vat_weight": "vw",
         "weight_decay": "wd",
@@ -448,14 +480,15 @@ Presets (--preset):
   distill     Knowledge Distillation (distill_T, distill_alpha)
   vat         VAT consistency (vat_weight, vat_epsilon)
   self_train  Self-training (rounds, threshold)
+  st_finetune Self-training fine-tuning (threshold + LP interaction)
+  st_dynamic  Self-training dynamic threshold (per-class adaptive, curriculum decay)
   clustering   Cluster label broadcasting (clusters, purity, model filter)
   cluster_propagation  Cluster broadcasting + label propagation agreement
   combined    Top-10 most impactful params (for random search)
 
 Examples:
-  python tune_hyperparams.py --method grid --ssl-method pseudo --preset lp
-  python tune_hyperparams.py --method random --ssl-method distill --preset combined --trials 30
-  python tune_hyperparams.py --method grid --ssl-method distill --preset distill,lp
+  py tune_hyperparams.py --method grid --ssl-method pseudo --preset lp
+  py tune_hyperparams.py --method random --ssl-method self_training --preset st_dynamic --trials 30
 """,
     )
 
@@ -464,10 +497,11 @@ Examples:
                         help="Search strategy")
     parser.add_argument("--preset", default="combined",
                         help="Comma-separated preset names to use for search space. "
-                             "Available: model, train, lp, distill, vat, self_train, clustering, cluster_propagation, combined")
+                             "Available: model, train, lp, distill, vat, self_train, st_finetune, "
+                             "st_dynamic, clustering, cluster_propagation, combined")
     parser.add_argument("--trials", type=int, default=0,
                         help="Number of random trials (0 = use all grid combinations)")
-    parser.add_argument("--ssl-method", choices=["pseudo", "distill", "self_training", "clustering", "cluster_propagation"],
+    parser.add_argument("--ssl-method", choices=["pseudo", "distill", "self_training", "clustering", "cluster_propagation", "constrained_clustering"],
                         default="distill")
 
     # Experiment
