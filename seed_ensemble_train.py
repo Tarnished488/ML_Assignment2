@@ -95,6 +95,24 @@ def build_train_command(args, seed: int) -> list[str]:
         cmd.append("--use-vat")
     if args.vat_weight is not None:
         cmd.extend(["--vat-weight", str(args.vat_weight)])
+    if args.use_fixmatch:
+        cmd.append("--use-fixmatch")
+    if args.fm_weight is not None:
+        cmd.extend(["--fm-weight", str(args.fm_weight)])
+    if args.fm_initial_threshold is not None:
+        cmd.extend(["--fm-initial-threshold", str(args.fm_initial_threshold)])
+    if args.fm_threshold_decay is not None:
+        cmd.extend(["--fm-threshold-decay", str(args.fm_threshold_decay)])
+    if args.fm_min_threshold is not None:
+        cmd.extend(["--fm-min-threshold", str(args.fm_min_threshold)])
+    if args.fm_weak_std is not None:
+        cmd.extend(["--fm-weak-std", str(args.fm_weak_std)])
+    if args.fm_strong_std is not None:
+        cmd.extend(["--fm-strong-std", str(args.fm_strong_std)])
+    if args.fm_dropout_rate is not None:
+        cmd.extend(["--fm-dropout-rate", str(args.fm_dropout_rate)])
+    if args.fm_rampup is not None:
+        cmd.extend(["--fm-rampup", str(args.fm_rampup)])
     if args.pretrain_lr is not None:
         cmd.extend(["--pretrain-lr", str(args.pretrain_lr)])
     return cmd
@@ -195,6 +213,15 @@ def main():
     parser.add_argument("--cluster-max-seeds", type=int, default=5)
     parser.add_argument("--use-vat", action="store_true")
     parser.add_argument("--vat-weight", type=float, default=None)
+    parser.add_argument("--use-fixmatch", action="store_true")
+    parser.add_argument("--fm-weight", type=float, default=None)
+    parser.add_argument("--fm-initial-threshold", type=float, default=None)
+    parser.add_argument("--fm-threshold-decay", type=float, default=None)
+    parser.add_argument("--fm-min-threshold", type=float, default=None)
+    parser.add_argument("--fm-weak-std", type=float, default=None)
+    parser.add_argument("--fm-strong-std", type=float, default=None)
+    parser.add_argument("--fm-dropout-rate", type=float, default=None)
+    parser.add_argument("--fm-rampup", type=int, default=None)
     parser.add_argument("--use-all-labeled", action="store_true")
     args = parser.parse_args()
 

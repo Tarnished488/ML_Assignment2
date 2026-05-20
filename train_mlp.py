@@ -34,7 +34,7 @@ from src.preprocessing.data_loader import (
     load_unlabeled_data,
     _resolve_data_dir,
 )
-from src.ssl.consistency import CombinedSSLLoss
+from src.ssl.consistency import CombinedSSLLoss, FixMatchLoss
 from src.ssl.clustering import ClusteringSSL, ConstrainedClusteringSSL
 from src.ssl.label_propagation import LabelPropagationSSL
 from src.ssl.self_training import SelfTrainingSSL
@@ -215,10 +215,11 @@ def train_distill(
 
 def train_standard(
     model, X_train, y_train, X_val, y_val, device, args,
-    stage_name="train", X_unlabeled=None,
+    stage_name="train", X_unlabeled=None, fixmatch_criterion=None,
 ):
-    """Train with CE loss + optional VAT consistency."""
+    """Train with CE loss + optional VAT consistency + optional FixMatch."""
     has_val = X_val is not None and y_val is not None
+    use_fixmatch = fixmatch_criterion is not None and X_unlabeled is not None
 
     criterion = CombinedSSLLoss(
         vat_weight=args.vat_weight if args.use_vat else 0.0,
@@ -240,19 +241,27 @@ def train_standard(
                               shuffle=True, drop_last=True)
     val_loader = make_loader(X_val, y_val, args.batch_size, shuffle=False) if has_val else None
     unlabeled_loader = None
-    if X_unlabeled is not None and args.use_vat:
-        unlabeled_loader = make_loader(X_unlabeled, batch_size=args.batch_size * 4, shuffle=True)
+    fixmatch_loader = None
+    if X_unlabeled is not None:
+        if args.use_vat:
+            unlabeled_loader = make_loader(X_unlabeled, batch_size=args.batch_size * 4, shuffle=True)
+        if use_fixmatch:
+            fixmatch_loader = make_loader(X_unlabeled, batch_size=args.batch_size * 2, shuffle=True)
 
-    history = {"train_loss": [], "val_loss": [], "val_acc": [], "val_macro_f1": [], "lr": []}
+    history = {"train_loss": [], "val_loss": [], "val_acc": [], "val_macro_f1": [], "lr": [],
+               "fm_confident": []}
     best_state, best_val_acc, best_val_f1, best_epoch = None, -1.0, -1.0, 0
     epochs_no_improve = 0
 
     for epoch in range(1, args.epochs + 1):
         model.train()
         criterion.set_epoch(epoch)
-        total_loss, total_count = 0.0, 0
+        if use_fixmatch:
+            fixmatch_criterion.set_epoch(epoch)
+        total_loss, total_ce, total_fm, total_count, total_fm_confident = 0.0, 0.0, 0.0, 0, 0
 
         unlabeled_iter = iter(unlabeled_loader) if unlabeled_loader else None
+        fixmatch_iter = iter(fixmatch_loader) if fixmatch_loader else None
 
         for batch in train_loader:
             X_b, y_b = batch[0].to(device), batch[1].to(device)
@@ -265,18 +274,38 @@ def train_standard(
                     unlabeled_iter = iter(unlabeled_loader)
                     x_unl = next(unlabeled_iter)[0].to(device)
 
+            x_fm = None
+            if fixmatch_iter is not None:
+                try:
+                    x_fm = next(fixmatch_iter)[0].to(device)
+                except StopIteration:
+                    fixmatch_iter = iter(fixmatch_loader)
+                    x_fm = next(fixmatch_iter)[0].to(device)
+
             loss = criterion(model, X_b, y_b, x_unl)
+            ce_loss = loss.detach()
+
+            fm_loss = torch.tensor(0.0, device=device)
+            fm_confident = 0
+            if use_fixmatch and x_fm is not None:
+                fm_loss, fm_confident = fixmatch_criterion(model, X_b, y_b, x_fm)
+                loss = loss + fm_loss
+
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
             total_loss += loss.item() * X_b.size(0)
+            total_ce += ce_loss.item() * X_b.size(0)
+            total_fm += fm_loss.item() * X_b.size(0)
             total_count += X_b.size(0)
+            total_fm_confident += fm_confident
 
         train_loss = total_loss / total_count
         history["train_loss"].append(train_loss)
         history["lr"].append(optimizer.param_groups[0]["lr"])
+        history["fm_confident"].append(total_fm_confident)
 
         if has_val:
             val_pred, _, _ = predict(model, val_loader, device)
@@ -314,8 +343,10 @@ def train_standard(
                 f"| val_acc={val_metrics['accuracy']:.4f} "
                 f"| val_f1={val_metrics['macro_f1']:.4f}"
             ) if has_val else ""
+            fm_str = f" | fm_conf={total_fm_confident}" if use_fixmatch else ""
             print(
                 f"  [{stage_name}] Epoch {epoch:03d} | loss={train_loss:.4f} "
+                f"(CE={total_ce/total_count:.4f} FM={total_fm/total_count:.4f}){fm_str}"
                 f"{val_str} "
                 f"| lr={optimizer.param_groups[0]['lr']:.6f}"
             )
@@ -508,10 +539,37 @@ def train_self_training(
     best_val_acc = -1.0
     best_val_f1 = -1.0
 
+    use_fixmatch = getattr(args, "use_fixmatch", False)
+    fm_initial_thresh = getattr(args, "fm_initial_threshold", 0.97)
+    fm_thresh_decay = getattr(args, "fm_threshold_decay", 0.85)
+    fm_min_thresh = getattr(args, "fm_min_threshold", 0.80)
+
     for round_idx in range(1, args.self_train_rounds + 1):
         model = build_model(X_current.shape[1], num_classes, args, device)
         stage_name = f"self_train_r{round_idx}"
+
+        # FixMatch curriculum: threshold decays across rounds
+        fixmatch_criterion = None
+        if use_fixmatch and len(X_remaining) > 0:
+            fm_threshold = max(
+                fm_initial_thresh * (fm_thresh_decay ** max(round_idx - 1, 0)),
+                fm_min_thresh,
+            )
+            fixmatch_criterion = FixMatchLoss(
+                fm_weight=getattr(args, "fm_weight", 1.0),
+                fm_threshold=fm_threshold,
+                weak_std=getattr(args, "fm_weak_std", 0.10),
+                strong_std=getattr(args, "fm_strong_std", 0.30),
+                dropout_rate=getattr(args, "fm_dropout_rate", 0.20),
+                ramp_up_epochs=getattr(args, "fm_rampup", 30),
+            )
+            print(
+                f"  [SelfTraining] FixMatch enabled: threshold={fm_threshold:.3f}, "
+                f"weight={fixmatch_criterion.fm_weight}"
+            )
+
         unlabeled_for_vat = X_remaining if args.use_vat and len(X_remaining) > 0 else None
+        unlabeled_for_train = X_remaining if use_fixmatch and len(X_remaining) > 0 else unlabeled_for_vat
         model, history, best_epoch, best_val_acc, best_val_f1 = train_standard(
             model,
             X_current,
@@ -521,7 +579,8 @@ def train_self_training(
             device,
             args,
             stage_name=stage_name,
-            X_unlabeled=unlabeled_for_vat,
+            X_unlabeled=unlabeled_for_train,
+            fixmatch_criterion=fixmatch_criterion,
         )
         print(
             f"  [SelfTraining] Round {round_idx} val_acc={best_val_acc:.4f} "
@@ -531,6 +590,8 @@ def train_self_training(
         round_summaries[-1]["best_epoch"] = int(best_epoch)
         round_summaries[-1]["best_val_acc"] = float(best_val_acc)
         round_summaries[-1]["best_val_macro_f1"] = float(best_val_f1)
+        if fixmatch_criterion is not None:
+            round_summaries[-1]["fm_threshold"] = float(fm_threshold)
 
         if round_idx >= args.self_train_rounds or len(X_remaining) == 0:
             break
@@ -655,9 +716,35 @@ def train_pretrain_guided_self_training(
     best_val_acc = pretrain_val_acc
     best_val_f1 = pretrain_val_f1
 
+    use_fixmatch = getattr(args, "use_fixmatch", False)
+    fm_initial_thresh = getattr(args, "fm_initial_threshold", 0.97)
+    fm_thresh_decay = getattr(args, "fm_threshold_decay", 0.85)
+    fm_min_thresh = getattr(args, "fm_min_threshold", 0.80)
+
     for round_idx in range(1, args.self_train_rounds + 1):
         stage_name = f"finetune_r{round_idx}"
+
+        fixmatch_criterion = None
+        if use_fixmatch and len(X_remaining) > 0:
+            fm_threshold = max(
+                fm_initial_thresh * (fm_thresh_decay ** max(round_idx - 1, 0)),
+                fm_min_thresh,
+            )
+            fixmatch_criterion = FixMatchLoss(
+                fm_weight=getattr(args, "fm_weight", 1.0),
+                fm_threshold=fm_threshold,
+                weak_std=getattr(args, "fm_weak_std", 0.10),
+                strong_std=getattr(args, "fm_strong_std", 0.30),
+                dropout_rate=getattr(args, "fm_dropout_rate", 0.20),
+                ramp_up_epochs=getattr(args, "fm_rampup", 30),
+            )
+            print(
+                f"  [SelfTraining] FixMatch enabled: threshold={fm_threshold:.3f}, "
+                f"weight={fixmatch_criterion.fm_weight}"
+            )
+
         unlabeled_for_vat = X_remaining if args.use_vat and len(X_remaining) > 0 else None
+        unlabeled_for_train = X_remaining if use_fixmatch and len(X_remaining) > 0 else unlabeled_for_vat
         model, history, best_epoch, best_val_acc, best_val_f1 = train_standard(
             model,
             X_current,
@@ -667,7 +754,8 @@ def train_pretrain_guided_self_training(
             device,
             args,
             stage_name=stage_name,
-            X_unlabeled=unlabeled_for_vat,
+            X_unlabeled=unlabeled_for_train,
+            fixmatch_criterion=fixmatch_criterion,
         )
         print(
             f"  [SelfTraining] Round {round_idx} val_acc={best_val_acc:.4f} "
@@ -677,6 +765,8 @@ def train_pretrain_guided_self_training(
         round_summaries[-1]["best_epoch"] = int(best_epoch)
         round_summaries[-1]["best_val_acc"] = float(best_val_acc)
         round_summaries[-1]["best_val_macro_f1"] = float(best_val_f1)
+        if fixmatch_criterion is not None:
+            round_summaries[-1]["fm_threshold"] = float(fm_threshold)
 
         if round_idx >= args.self_train_rounds or len(X_remaining) == 0:
             break
@@ -1562,6 +1652,26 @@ def main():
     parser.add_argument("--pi-weight", type=float, default=0.1)
     parser.add_argument("--vat-epsilon", type=float, default=2.0)
     parser.add_argument("--vat-rampup", type=int, default=50)
+
+    # FixMatch (weak/strong augmentation + confidence masking)
+    parser.add_argument("--use-fixmatch", action="store_true",
+                        help="Enable FixMatch-style consistency loss on unlabeled data.")
+    parser.add_argument("--fm-weight", type=float, default=1.0,
+                        help="Weight for FixMatch loss relative to CE.")
+    parser.add_argument("--fm-initial-threshold", type=float, default=0.97,
+                        help="Initial confidence threshold for FixMatch (round 1, decays each round).")
+    parser.add_argument("--fm-threshold-decay", type=float, default=0.85,
+                        help="Multiplicative decay of FixMatch threshold each round.")
+    parser.add_argument("--fm-min-threshold", type=float, default=0.80,
+                        help="Floor for the FixMatch threshold.")
+    parser.add_argument("--fm-weak-std", type=float, default=0.10,
+                        help="Gaussian noise std for weak augmentation.")
+    parser.add_argument("--fm-strong-std", type=float, default=0.30,
+                        help="Gaussian noise std for strong augmentation.")
+    parser.add_argument("--fm-dropout-rate", type=float, default=0.20,
+                        help="Feature dropout rate for strong augmentation.")
+    parser.add_argument("--fm-rampup", type=int, default=30,
+                        help="Epochs over which to linearly ramp up FixMatch weight.")
 
     # Misc
     parser.add_argument("--seed", type=int, default=42)
