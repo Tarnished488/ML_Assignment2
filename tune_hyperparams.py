@@ -88,6 +88,23 @@ PRESETS: dict[str, dict[str, Any]] = {
         "self_train_threshold": [0.75, 0.80, 0.85, 0.90, 0.95],
     },
 
+    "clustering": {
+        "cluster_n_clusters": [30, 50, 80, 120],
+        "cluster_conf": [0.4, 0.5, 0.6, 0.7],
+        "cluster_top_k": [200, 300, 500],
+        "cluster_model_conf": [0.6, 0.7, 0.8],
+    },
+
+    "cluster_propagation": {
+        "cluster_n_clusters": [30, 50, 80, 120],
+        "cluster_conf": [0.4, 0.5, 0.6],
+        "cluster_top_k": [300, 500],
+        "cluster_model_conf": [0.6, 0.7, 0.8],
+        "lp_k": [10, 15, 20],
+        "lp_conf": [0.5, 0.6, 0.7],
+        "lp_top_k": [300, 500],
+    },
+
     # ── ST fine-tuning (threshold + LP interaction) ─────────────────
     # Self-adaptive: per-class thresholds + curriculum decay per round.
     # Literature (FreeMatch/PabLO 2024): fixed 0.95 is suboptimal;
@@ -135,6 +152,13 @@ DEFAULT_FIXED = {
     "vat_epsilon": 2.0,
     "self_train_rounds": 3,
     "self_train_threshold": 0.85,
+    "cluster_n_clusters": 50,
+    "cluster_conf": 0.5,
+    "cluster_top_k": 300,
+    "cluster_min_labeled": 1,
+    "cluster_max_iter": 80,
+    "cluster_n_init": 3,
+    "cluster_model_conf": 0.7,
     "epochs": 300,
     "patience": 50,
     "lr_factor": 0.5,
@@ -201,6 +225,13 @@ def build_command(trial_cfg: dict[str, Any], ssl_method: str, data_dir: str) -> 
         "vat_epsilon": "--vat-epsilon",
         "self_train_rounds": "--self-train-rounds",
         "self_train_threshold": "--self-train-threshold",
+        "cluster_n_clusters": "--cluster-n-clusters",
+        "cluster_conf": "--cluster-conf",
+        "cluster_top_k": "--cluster-top-k",
+        "cluster_min_labeled": "--cluster-min-labeled",
+        "cluster_max_iter": "--cluster-max-iter",
+        "cluster_n_init": "--cluster-n-init",
+        "cluster_model_conf": "--cluster-model-conf",
         "epochs": "--epochs",
         "patience": "--patience",
         "lr_factor": "--lr-factor",
@@ -219,6 +250,8 @@ def build_command(trial_cfg: dict[str, Any], ssl_method: str, data_dir: str) -> 
 
     if trial_cfg.get("pretrain_first"):
         cmd.append("--pretrain-first")
+    if trial_cfg.get("cluster_require_agreement") is False:
+        cmd.append("--cluster-no-agreement")
 
     return cmd
 
@@ -252,6 +285,13 @@ def compact_trial_name(
         "seed": "sd",
         "self_train_rounds": "str",
         "self_train_threshold": "stt",
+        "cluster_n_clusters": "cn",
+        "cluster_conf": "cc",
+        "cluster_top_k": "ct",
+        "cluster_min_labeled": "cml",
+        "cluster_max_iter": "cmi",
+        "cluster_n_init": "cni",
+        "cluster_model_conf": "cmc",
         "vat_epsilon": "ve",
         "vat_weight": "vw",
         "weight_decay": "wd",
@@ -408,6 +448,8 @@ Presets (--preset):
   distill     Knowledge Distillation (distill_T, distill_alpha)
   vat         VAT consistency (vat_weight, vat_epsilon)
   self_train  Self-training (rounds, threshold)
+  clustering   Cluster label broadcasting (clusters, purity, model filter)
+  cluster_propagation  Cluster broadcasting + label propagation agreement
   combined    Top-10 most impactful params (for random search)
 
 Examples:
@@ -422,10 +464,10 @@ Examples:
                         help="Search strategy")
     parser.add_argument("--preset", default="combined",
                         help="Comma-separated preset names to use for search space. "
-                             "Available: model, train, lp, distill, vat, self_train, combined")
+                             "Available: model, train, lp, distill, vat, self_train, clustering, cluster_propagation, combined")
     parser.add_argument("--trials", type=int, default=0,
                         help="Number of random trials (0 = use all grid combinations)")
-    parser.add_argument("--ssl-method", choices=["pseudo", "distill", "self_training"],
+    parser.add_argument("--ssl-method", choices=["pseudo", "distill", "self_training", "clustering", "cluster_propagation"],
                         default="distill")
 
     # Experiment
@@ -435,7 +477,7 @@ Examples:
     parser.add_argument("--timeout", type=int, default=1800,
                         help="Max seconds per trial")
     parser.add_argument("--pretrain-first", action="store_true",
-                        help="Use labeled pretraining before self-training trials.")
+                        help="Use labeled pretraining before retraining trials.")
 
     args = parser.parse_args()
 
@@ -472,6 +514,7 @@ Examples:
                 cfg[key] = default_val
         cfg["seed"] = args.seed
         cfg["pretrain_first"] = args.pretrain_first
+        cfg["cluster_require_agreement"] = True
 
     # ── Output directory ────────────────────────────────────────────
     output_dir = Path(args.output_dir) / args.ssl_method

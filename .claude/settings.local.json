@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(head -5 \"C:\\\\Users\\\\yqy08\\\\Desktop\\\\数据挖掘和机器学习\\\\Assignment\\\\Assignment 2\\\\comp-3027-j-assignment-2-bdic-2026\\\\train_unlabeled_labels.csv\")",
+      "Read(//c/Users/yqy08/Desktop/数据挖掘和机器学习/Assignment/Assignment 2/comp-3027-j-assignment-2-bdic-2026/**)"
+    ]
+  }
+}

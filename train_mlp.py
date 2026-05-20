@@ -35,6 +35,7 @@ from src.preprocessing.data_loader import (
     _resolve_data_dir,
 )
 from src.ssl.consistency import CombinedSSLLoss
+from src.ssl.clustering import ClusteringSSL
 from src.ssl.label_propagation import LabelPropagationSSL
 from src.ssl.self_training import SelfTrainingSSL
 from src.utils import compute_metrics, encode_labels, make_loader, predict, set_seed
@@ -684,6 +685,258 @@ def train_pretrain_guided_self_training(
     return model, history, best_epoch, best_val_acc, best_val_f1, X_current, y_current, round_summaries
 
 
+def train_pretrain_guided_clustering(
+    X_train_raw,
+    y_train,
+    X_val_raw,
+    y_val,
+    X_unlabeled,
+    num_classes,
+    device,
+    args,
+):
+    """Pretrain first, filter cluster-broadcast labels, then continue training."""
+    model = build_model(X_train_raw.shape[1], num_classes, args, device)
+    pretrain_args = SimpleNamespace(**vars(args))
+    pretrain_args.epochs = args.pretrain_epochs
+    pretrain_args.patience = args.pretrain_patience
+    if args.pretrain_lr is not None:
+        pretrain_args.lr = args.pretrain_lr
+
+    print(
+        "Training: Pretrain -> Cluster Label Broadcasting | "
+        f"pretrain_epochs={pretrain_args.epochs}"
+    )
+    model, _, pretrain_epoch, pretrain_val_acc, pretrain_val_f1 = train_standard(
+        model,
+        X_train_raw,
+        y_train,
+        X_val_raw,
+        y_val,
+        device,
+        pretrain_args,
+        stage_name="pretrain",
+        X_unlabeled=None,
+    )
+
+    _, calibration = calibrate_self_training_threshold(
+        model=model,
+        X_val=X_val_raw,
+        y_val=y_val,
+        device=device,
+        args=args,
+    )
+    model_threshold = args.cluster_model_conf
+
+    clustering = ClusteringSSL(
+        n_clusters=args.cluster_n_clusters,
+        confidence_threshold=args.cluster_conf,
+        class_balanced=True,
+        top_k_per_class=args.cluster_top_k,
+        min_labeled_per_cluster=args.cluster_min_labeled,
+        max_iter=args.cluster_max_iter,
+        n_init=args.cluster_n_init,
+        random_state=args.seed,
+    )
+
+    print(
+        f"  [ClusteringSSL] KMeans label broadcasting "
+        f"(k={args.cluster_n_clusters}, n_total={len(y_train) + len(X_unlabeled)}) ..."
+    )
+    pseudo_labels, cluster_confs = clustering.generate_pseudo_labels(
+        X_labeled=X_train_raw,
+        y_labeled=y_train,
+        X_unlabeled=X_unlabeled,
+    )
+    keep = clustering.select_pseudo_labels(pseudo_labels, cluster_confs, num_classes)
+
+    test_loader = make_loader(X_unlabeled, batch_size=args.batch_size, shuffle=False)
+    model_preds, model_confs, _ = predict(model, test_loader, device)
+    pretrain_keep = model_confs >= model_threshold
+    if args.cluster_require_agreement:
+        pretrain_keep &= model_preds == pseudo_labels
+    keep &= pretrain_keep
+
+    print(
+        f"  [ClusteringSSL] Kept {int(keep.sum())}/{len(keep)} broadcast labels "
+        f"(purity>={args.cluster_conf:.2f}, model_conf>={model_threshold:.2f}, "
+        f"agreement={args.cluster_require_agreement})"
+    )
+
+    if keep.any():
+        X_train_ssl = np.vstack([X_train_raw, X_unlabeled[keep]])
+        y_train_ssl = np.concatenate([y_train, pseudo_labels[keep]])
+    else:
+        X_train_ssl = X_train_raw
+        y_train_ssl = y_train
+
+    model, history, best_epoch, best_val_acc, best_val_f1 = train_standard(
+        model,
+        X_train_ssl,
+        y_train_ssl,
+        X_val_raw,
+        y_val,
+        device,
+        args,
+        stage_name="cluster_retrain",
+        X_unlabeled=X_unlabeled if args.use_vat else None,
+    )
+
+    summary = [{
+        "round": 0,
+        "method": "pretrain",
+        "best_epoch": int(pretrain_epoch),
+        "best_val_acc": float(pretrain_val_acc),
+        "best_val_macro_f1": float(pretrain_val_f1),
+        "calibration": calibration,
+    }, {
+        "round": 1,
+        "method": "cluster_label_broadcast",
+        "added": int(keep.sum()),
+        "train_size": int(len(y_train_ssl)),
+        "cluster_conf": float(args.cluster_conf),
+        "model_conf": float(model_threshold),
+        "require_agreement": bool(args.cluster_require_agreement),
+    }]
+    return model, history, best_epoch, best_val_acc, best_val_f1, X_train_ssl, y_train_ssl, summary
+
+
+def train_pretrain_guided_cluster_propagation(
+    X_train_raw,
+    y_train,
+    X_val_raw,
+    y_val,
+    X_unlabeled,
+    num_classes,
+    device,
+    args,
+):
+    """Pretrain first, then keep pseudo-labels agreed by clustering + LP."""
+    model = build_model(X_train_raw.shape[1], num_classes, args, device)
+    pretrain_args = SimpleNamespace(**vars(args))
+    pretrain_args.epochs = args.pretrain_epochs
+    pretrain_args.patience = args.pretrain_patience
+    if args.pretrain_lr is not None:
+        pretrain_args.lr = args.pretrain_lr
+
+    print(
+        "Training: Pretrain -> Cluster + Label Propagation | "
+        f"pretrain_epochs={pretrain_args.epochs}"
+    )
+    model, _, pretrain_epoch, pretrain_val_acc, pretrain_val_f1 = train_standard(
+        model,
+        X_train_raw,
+        y_train,
+        X_val_raw,
+        y_val,
+        device,
+        pretrain_args,
+        stage_name="pretrain",
+        X_unlabeled=None,
+    )
+
+    _, calibration = calibrate_self_training_threshold(
+        model=model,
+        X_val=X_val_raw,
+        y_val=y_val,
+        device=device,
+        args=args,
+    )
+
+    clustering = ClusteringSSL(
+        n_clusters=args.cluster_n_clusters,
+        confidence_threshold=args.cluster_conf,
+        class_balanced=True,
+        top_k_per_class=args.cluster_top_k,
+        min_labeled_per_cluster=args.cluster_min_labeled,
+        max_iter=args.cluster_max_iter,
+        n_init=args.cluster_n_init,
+        random_state=args.seed,
+    )
+    lp = LabelPropagationSSL(
+        n_neighbors=args.lp_k,
+        alpha=args.lp_alpha,
+        class_balanced=True,
+        top_k_per_class=args.lp_top_k,
+        confidence_threshold=args.lp_conf,
+    )
+
+    print(
+        f"  [Cluster+LP] Clustering k={args.cluster_n_clusters}; "
+        f"LP kNN={args.lp_k}, alpha={args.lp_alpha}"
+    )
+    cluster_labels, cluster_confs = clustering.generate_pseudo_labels(
+        X_labeled=X_train_raw,
+        y_labeled=y_train,
+        X_unlabeled=X_unlabeled,
+    )
+    X_all = np.vstack([X_train_raw, X_unlabeled])
+    lp_labels, lp_confs = lp.propagate(
+        X_all=X_all,
+        y_labeled=y_train,
+        n_labeled=len(y_train),
+    )
+
+    cluster_keep = clustering.select_pseudo_labels(
+        cluster_labels, cluster_confs, num_classes
+    )
+    lp_keep = lp.select_pseudo_labels(lp_labels, lp_confs, num_classes)
+    method_keep = cluster_keep & lp_keep & (cluster_labels == lp_labels)
+
+    unlabeled_loader = make_loader(X_unlabeled, batch_size=args.batch_size, shuffle=False)
+    model_preds, model_confs, _ = predict(model, unlabeled_loader, device)
+    model_keep = model_confs >= args.cluster_model_conf
+    if args.cluster_require_agreement:
+        model_keep &= model_preds == cluster_labels
+
+    keep = method_keep & model_keep
+    pseudo_labels = cluster_labels
+
+    print(
+        f"  [Cluster+LP] Kept {int(keep.sum())}/{len(keep)} pseudo-labels "
+        f"(cluster_conf>={args.cluster_conf:.2f}, lp_conf>={args.lp_conf:.2f}, "
+        f"model_conf>={args.cluster_model_conf:.2f}, agreement={args.cluster_require_agreement})"
+    )
+
+    if keep.any():
+        X_train_ssl = np.vstack([X_train_raw, X_unlabeled[keep]])
+        y_train_ssl = np.concatenate([y_train, pseudo_labels[keep]])
+    else:
+        X_train_ssl = X_train_raw
+        y_train_ssl = y_train
+
+    model, history, best_epoch, best_val_acc, best_val_f1 = train_standard(
+        model,
+        X_train_ssl,
+        y_train_ssl,
+        X_val_raw,
+        y_val,
+        device,
+        args,
+        stage_name="cluster_lp_retrain",
+        X_unlabeled=X_unlabeled if args.use_vat else None,
+    )
+
+    summary = [{
+        "round": 0,
+        "method": "pretrain",
+        "best_epoch": int(pretrain_epoch),
+        "best_val_acc": float(pretrain_val_acc),
+        "best_val_macro_f1": float(pretrain_val_f1),
+        "calibration": calibration,
+    }, {
+        "round": 1,
+        "method": "cluster_label_broadcast_plus_label_propagation",
+        "added": int(keep.sum()),
+        "train_size": int(len(y_train_ssl)),
+        "cluster_conf": float(args.cluster_conf),
+        "lp_conf": float(args.lp_conf),
+        "model_conf": float(args.cluster_model_conf),
+        "require_agreement": bool(args.cluster_require_agreement),
+    }]
+    return model, history, best_epoch, best_val_acc, best_val_f1, X_train_ssl, y_train_ssl, summary
+
+
 def make_experiment_name(args):
     base = args.base_name if getattr(args, "base_name", None) else args.name
     model_part = args.model_type if args.model_type == "mlp" else f"cnn_{args.cnn_layout}"
@@ -732,6 +985,7 @@ def run_single_experiment(args, device):
     y_train_ssl = y_train
     lp_soft = None  # soft probabilities for distillation
     self_training_rounds = None
+    ssl_stage_summary = None
 
     if args.use_ssl and args.ssl_method in {"distill", "pseudo"}:
         lp = LabelPropagationSSL(
@@ -770,6 +1024,28 @@ def run_single_experiment(args, device):
         print(f"Training set: {len(y_train_ssl)} samples "
               f"(original {len(y_train)} + pseudo {len(y_train_ssl) - len(y_train)})")
 
+    if args.use_ssl and args.ssl_method == "clustering" and not args.pretrain_first:
+        clustering = ClusteringSSL(
+            n_clusters=args.cluster_n_clusters,
+            confidence_threshold=args.cluster_conf,
+            class_balanced=True,
+            top_k_per_class=args.cluster_top_k,
+            min_labeled_per_cluster=args.cluster_min_labeled,
+            max_iter=args.cluster_max_iter,
+            n_init=args.cluster_n_init,
+            random_state=args.seed,
+        )
+        X_train_ssl, y_train_ssl = clustering(
+            model=None,
+            X_labeled=X_train_raw,
+            y_labeled=y_train,
+            X_unlabeled=X_unlabeled,
+            device=device,
+            num_classes=num_classes,
+        )
+        print(f"Training set: {len(y_train_ssl)} samples "
+              f"(original {len(y_train)} + broadcast {len(y_train_ssl) - len(y_train)})")
+
     # ------------------------------------------------------------------
     # 3. Build model and train
     # ------------------------------------------------------------------
@@ -800,6 +1076,28 @@ def run_single_experiment(args, device):
                 device,
                 args,
             )
+    elif args.use_ssl and args.ssl_method == "clustering" and args.pretrain_first:
+        model, history, best_epoch, best_val_acc, best_val_f1, X_train_ssl, y_train_ssl, ssl_stage_summary = train_pretrain_guided_clustering(
+            X_train_raw,
+            y_train,
+            X_val_raw,
+            y_val,
+            X_unlabeled,
+            num_classes,
+            device,
+            args,
+        )
+    elif args.use_ssl and args.ssl_method == "cluster_propagation":
+        model, history, best_epoch, best_val_acc, best_val_f1, X_train_ssl, y_train_ssl, ssl_stage_summary = train_pretrain_guided_cluster_propagation(
+            X_train_raw,
+            y_train,
+            X_val_raw,
+            y_val,
+            X_unlabeled,
+            num_classes,
+            device,
+            args,
+        )
     else:
         model = build_model(X_train_ssl.shape[1], num_classes, args, device)
 
@@ -809,7 +1107,14 @@ def run_single_experiment(args, device):
             model, X_train_ssl, y_train_ssl, lp_soft, X_unlabeled,
             X_val_raw, y_val, device, args,
         )
-    elif not (args.use_ssl and args.ssl_method == "self_training"):
+    elif not (
+        args.use_ssl
+        and (
+            args.ssl_method == "self_training"
+            or (args.ssl_method == "clustering" and args.pretrain_first)
+            or args.ssl_method == "cluster_propagation"
+        )
+    ):
         unlabeled_for_vat = X_unlabeled if args.use_vat else None
         model, history, best_epoch, best_val_acc, best_val_f1 = train_standard(
             model, X_train_ssl, y_train_ssl, X_val_raw, y_val, device, args,
@@ -871,6 +1176,8 @@ def run_single_experiment(args, device):
     }
     if self_training_rounds is not None:
         metrics["self_training_rounds"] = self_training_rounds
+    if ssl_stage_summary is not None:
+        metrics["ssl_stage_summary"] = ssl_stage_summary
 
     metrics_path = out / "metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
@@ -912,10 +1219,15 @@ def planned_experiments(args):
         (True, "pseudo"),
         (True, "distill"),
         (True, "self_training"),
+        (True, "clustering"),
+        (True, "cluster_propagation"),
     ]
 
+    if getattr(args, "only_supervised", False):
+        ssl_variants = [(False, "supervised")]
+
     # When --models is used with --use-ssl, only run the specified method (+ supervised baseline)
-    if getattr(args, "models", None) and args.use_ssl:
+    if getattr(args, "models", None) and args.use_ssl and not getattr(args, "only_supervised", False):
         keep_baseline = not getattr(args, "no_baseline", False)
         ssl_variants = [v for v in ssl_variants
                         if v[1] == args.ssl_method or (not v[0] and keep_baseline)]
@@ -978,7 +1290,7 @@ def main():
 
     # SSL
     parser.add_argument("--use-ssl", action="store_true")
-    parser.add_argument("--ssl-method", choices=["distill", "pseudo", "self_training"],
+    parser.add_argument("--ssl-method", choices=["distill", "pseudo", "self_training", "clustering", "cluster_propagation"],
                         default="distill")
     parser.add_argument("--lp-k", type=int, default=10)
     parser.add_argument("--lp-alpha", type=float, default=0.99)
@@ -996,6 +1308,22 @@ def main():
     parser.add_argument("--pretrain-threshold-max", type=float, default=0.95)
     parser.add_argument("--pretrain-top-k", type=int, default=128,
                         help="Per-class cap for pseudo-labels selected from the pretrained model.")
+    parser.add_argument("--cluster-n-clusters", type=int, default=50)
+    parser.add_argument("--cluster-conf", type=float, default=0.5,
+                        help="Minimum cluster purity for broadcast labels.")
+    parser.add_argument("--cluster-top-k", type=int, default=300,
+                        help="Per-class cap for cluster-broadcast pseudo-labels.")
+    parser.add_argument("--cluster-min-labeled", type=int, default=1,
+                        help="Minimum labeled samples in a cluster before broadcasting.")
+    parser.add_argument("--cluster-max-iter", type=int, default=80)
+    parser.add_argument("--cluster-n-init", type=int, default=3)
+    parser.add_argument("--cluster-model-conf", type=float, default=0.7,
+                        help="Fallback pretrained-model confidence threshold when no val split exists.")
+    parser.add_argument("--cluster-require-agreement", action="store_true", default=True,
+                        help="Keep cluster labels only when the pretrained model predicts the same class.")
+    parser.add_argument("--cluster-no-agreement", action="store_false",
+                        dest="cluster_require_agreement",
+                        help="Disable pretrained-model agreement filtering for cluster labels.")
 
     # Distillation
     parser.add_argument("--distill-T", type=float, default=2.0,
@@ -1016,6 +1344,8 @@ def main():
     parser.add_argument("--no-viz", action="store_true")
     parser.add_argument("--no-baseline", action="store_true",
                         help="Skip supervised baseline (used for tuning)")
+    parser.add_argument("--only-supervised", action="store_true",
+                        help="Run only the supervised baseline for the selected model(s).")
 
     args = parser.parse_args()
     args.base_name = args.name
